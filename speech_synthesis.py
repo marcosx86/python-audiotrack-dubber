@@ -31,6 +31,7 @@ def parse_args():
     # Output configuration
     parser.add_argument("--output-file", "-o", default="translated_output.wav", help="Path to save the final synthesized audio")
     parser.add_argument("--ffmpeg-path", default="ffmpeg", help="Custom path to the ffmpeg executable")
+    parser.add_argument("--fp16", action="store_true", help="Enable FP16 precision for CosyVoice inference to speed up generation")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose debug logging")
     return parser.parse_args()
 
@@ -179,10 +180,10 @@ def main():
         logging.error(f"Failed to import CosyVoice. Ensure you have the library installed. Error: {e}")
         sys.exit(1)
         
-    logging.info(f"Initializing CosyVoice AutoModel with model: {args.model_dir}")
+    logging.info(f"Initializing CosyVoice AutoModel with model: {args.model_dir} (fp16={args.fp16})")
     
     try:
-        cosyvoice = AutoModel(model_dir=args.model_dir)
+        cosyvoice = AutoModel(model_dir=args.model_dir, fp16=args.fp16)
     except Exception as e:
         logging.error(f"Failed to initialize CosyVoice: {e}")
         sys.exit(1)
