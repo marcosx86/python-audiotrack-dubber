@@ -57,6 +57,45 @@ def extract_reference_audio(audio_path, start, duration, ffmpeg_path, target_sr=
             
     return tmp_name
 
+def apply_time_stretch_ffmpeg(waveform, sr, target_dur, ffmpeg_path):
+    """
+    If the waveform is longer than target_dur, stretches it using FFmpeg's atempo filter.
+    Returns the stretched tensor.
+    """
+    generated_dur = waveform.shape[1] / sr
+    if generated_dur <= target_dur * 1.02: # Allow tiny 2% margin to avoid unnecessary I/O
+        return waveform
+        
+    tempo = generated_dur / target_dur
+    # FFmpeg's atempo accepts values between 0.5 and 100.0.
+    tempo = min(tempo, 100.0)
+    
+    logging.debug(f"[TimeStretch] Compressing {generated_dur:.2f}s to {target_dur:.2f}s (Speed {tempo:.2f}x)")
+    
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_in, \
+         tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
+        in_name = tmp_in.name
+        out_name = tmp_out.name
+        
+    try:
+        torchaudio.save(in_name, waveform, sr)
+        
+        cmd = [
+            ffmpeg_path, "-y",
+            "-i", in_name,
+            "-filter:a", f"atempo={tempo}",
+            out_name
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        
+        stretched_wav, _ = torchaudio.load(out_name)
+        return stretched_wav
+    finally:
+        if os.path.exists(in_name):
+            os.remove(in_name)
+        if os.path.exists(out_name):
+            os.remove(out_name)
+
 def parse_transcriptions(orig_path, trans_path):
     """
     Parses both original and translated transcriptions.
@@ -252,7 +291,8 @@ def main():
             output = cosyvoice.inference_zero_shot(
                 tts_text=trans_text,
                 prompt_text=orig_text,
-                prompt_wav=reference_audio_path
+                prompt_wav=reference_audio_path,
+                text_frontend=False
             )
             
             # If it yields chunks (streaming), concatenate them
@@ -270,10 +310,31 @@ def main():
             final_audio_pieces.append(tts_speech.cpu())
             logging.debug(f"[Consumer] Copied processed tensor to CPU in {time.time() - cpu_t0:.3f}s")
             
-            # 3. Advance timeline by the EXACT duration of the generated audio
+            # --- START STRICT TIMELINE MODEL ---
             generated_dur = tts_speech.shape[1] / target_sr
-            current_time += generated_dur
-            logging.debug(f"  Generated {generated_dur:.2f}s of audio.")
+            target_dur = end - start
+            
+            if generated_dur > target_dur:
+                # 3a. Stretch audio if it exceeds strict window
+                stretched_speech = apply_time_stretch_ffmpeg(tts_speech.cpu(), target_sr, target_dur, args.ffmpeg_path)
+                final_audio_pieces[-1] = stretched_speech
+                logging.debug(f"  Time-stretched audio from {generated_dur:.2f}s down to {target_dur:.2f}s.")
+                
+                # Update generated duration after stretch
+                generated_dur = stretched_speech.shape[1] / target_sr
+            
+            if generated_dur < target_dur:
+                # 3b. Pad with silence if it's shorter than strict window
+                shortfall = target_dur - generated_dur
+                silence_samples = int(shortfall * target_sr)
+                if silence_samples > 0:
+                    final_audio_pieces.append(torch.zeros(1, silence_samples))
+                logging.debug(f"  Padded tail with {shortfall:.2f}s of silence.")
+                
+            # 4. Advance timeline strictly to the end of the original segment
+            current_time = end
+            logging.debug(f"  Timeline strictly advanced to {current_time:.2f}s.")
+            # --- END STRICT TIMELINE MODEL ---
 
         except Exception as e:
             logging.error(f"  TTS generation failed for segment {idx+1}: {e}")
