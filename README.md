@@ -76,10 +76,12 @@ python translate_transcription.py transcript.txt --model-dir path/to/nllb-model 
 Synthesizes the translated text back into audio using the `CosyVoice` zero-shot TTS engine, aiming to emulate the pacing and tone of the original speaker, matched seamlessly to the original timestamps.
 
 **Key Features:**
-- **Dynamic Timeline Alignment**: Reads both original and translated transcriptions simultaneously. If the translation requires more or less time to speak, the script computes and pads exact silence gaps so the next sentence starts precisely at its original absolute timestamp.
-- **RAM-Efficient Audio Slicing**: Uses `torchaudio` combined with an `ffmpeg` subprocess to slice only the required reference context directly from the full source file, converting it to a 16kHz prompt on the fly.
+- **Asynchronous Extraction**: Implements a Producer-Consumer threading architecture with a managed queue, allowing CPU-bound FFmpeg audio slicing to pre-fetch perfectly in parallel with GPU-bound LLM generation.
+- **Strict Timeline & Time-Stretching**: Enforces absolute synchronization to the original video by dynamically applying FFmpeg's `atempo` time-stretch filter to squeeze generated audio if it exceeds its original timestamp window.
+- **Robust Text Normalization**: Intercepts numbers and normalizes them into localized Portuguese words using `num2words`, safely bypassing CosyVoice's default English normalization (`wetext`) for unsupported languages.
+- **Hardware Optimized**: Includes `--fp16` support to slash memory bandwidth overhead and maximize GPU utilization during standard PyTorch autoregressive inference loops.
 - **AutoModel Integration**: Natively supports `CosyVoice`, `CosyVoice2`, and `CosyVoice3` via dynamic factory initialization.
-- **DLL Auto-Fixer**: Automatically detects your global `ffmpeg.exe` and securely registers its directory to bypass `torchcodec` DLL load errors on Windows.
+- **DLL Auto-Fixer**: Automatically registers your global `ffmpeg.exe` directory to cleanly bypass `torchcodec` load errors on Windows Python 3.8+.
 
 **Usage Example:**
 ```bash
