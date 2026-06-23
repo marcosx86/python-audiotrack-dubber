@@ -4,15 +4,26 @@ This project provides a robust, two-step pipeline for extracting high-quality au
 
 ## Prerequisites
 
-- **Python 3.12** (Recommended, inside a virtual environment `.venv`)
+- **Python 3.12** (Recommended, inside a **Conda environment**)
 - **CUDA 12.6** (or compatible version)
 - **PyTorch & TorchCodec**: Ensure you install the versions compatible with your CUDA version (e.g., `cu126`).
 - **FFmpeg**: Requires a full **shared build** of FFmpeg (e.g., `v7.0.2-full_build-shared` on Windows). 
   - *Note:* Static builds might cause `libtorchcodec` loading errors on Windows Python 3.8+ due to missing DLLs.
 
+### Key Python Packages
+
+To successfully replicate this exact pipeline, the following major dependencies were configured in our Conda environment:
+
+- **Audio Processing & TTS**: `torch`, `torchaudio`, `torchcodec`, `cosyvoice`
+- **Transcription & Translation**: `whisperx`, `ctranslate2`
+- **Local LLM Integration**: `openai` (used as a lightweight client for LM Studio / llama.cpp API endpoints)
+- **Text Normalization (Windows)**: 
+  - `pynini=2.1.6.post1` (Specifically requires Conda for pre-compiled Windows binaries)
+  - `nemo_text_processing` (For advanced NeMo text normalization like `Normalizer('pt')`)
+
 ## Workflow
 
-The pipeline consists of four main scripts:
+The pipeline consists of five main scripts:
 
 ### 1. `transcribe.py`
 
@@ -71,14 +82,30 @@ python translate_transcription.py transcript.txt --model-dir path/to/nllb-model 
 ```
 *(Check `python translate_transcription.py --help` for a full list of arguments.)*
 
-### 4. `speech_synthesis.py`
+### 4. `condense_transcription.py`
+
+Condenses translated transcription lines using a local LLM via an OpenAI-compatible endpoint (like LM Studio). This is a crucial preprocessing step for dubbing languages that naturally expand significantly (like Portuguese from English), ensuring the synthesized audio can comfortably fit the original time bounds without requiring extreme, robotic time-stretching.
+
+**Key Features:**
+- **Local AI Pipeline**: Connects safely to local LLMs (LM Studio, llama.cpp) via the standard OpenAI API structure.
+- **Dynamic Character Limiting**: Automatically calculates a strict target character limit per segment based on its specific duration in the timeline.
+- **Hardware Protection**: Provides a `--cooldown` parameter to enforce delays between API calls and a `--context-length` parameter injected via `extra_body` during the JIT load warmup to prevent GPU overheating, BSODs, and VRAM OOMs during rapid, sequential inferences.
+- **Smart Preservation**: Safely skips short sentences, gracefully buffers multiline transcriptions, flawlessly preserves the strict WhisperX prefix formatting, and protects against token hallucination via system prompt enforcement.
+
+**Usage Example:**
+```bash
+python condense_transcription.py --output-file condensed_translation.txt --model qwen2.5-7b-instruct-1m@q4_k_m --temperature 0.2 --cooldown 1.5 --context-length 2048 translated_transcription.txt
+```
+*(Check `python condense_transcription.py --help` for a full list of arguments.)*
+
+### 5. `speech_synthesis.py`
 
 Synthesizes the translated text back into audio using the `CosyVoice` zero-shot TTS engine, aiming to emulate the pacing and tone of the original speaker, matched seamlessly to the original timestamps.
 
 **Key Features:**
 - **Asynchronous Extraction**: Implements a Producer-Consumer threading architecture with a managed queue, allowing CPU-bound FFmpeg audio slicing to pre-fetch perfectly in parallel with GPU-bound LLM generation.
 - **Strict Timeline & Time-Stretching**: Enforces absolute synchronization to the original video by dynamically applying FFmpeg's `atempo` time-stretch filter to squeeze generated audio if it exceeds its original timestamp window.
-- **Robust Text Normalization**: Intercepts numbers and normalizes them into localized Portuguese words using `num2words`, safely bypassing CosyVoice's default English normalization (`wetext`) for unsupported languages.
+- **Robust Text Normalization**: Intercepts numbers and normalizes them into localized Portuguese words using NVIDIA's `nemo_text_processing`, safely bypassing CosyVoice's default English normalization (`wetext`) for unsupported languages.
 - **Hardware Optimized**: Includes `--fp16` support to slash memory bandwidth overhead and maximize GPU utilization during standard PyTorch autoregressive inference loops.
 - **AutoModel Integration**: Natively supports `CosyVoice`, `CosyVoice2`, and `CosyVoice3` via dynamic factory initialization.
 - **DLL Auto-Fixer**: Automatically registers your global `ffmpeg.exe` directory to cleanly bypass `torchcodec` load errors on Windows Python 3.8+.

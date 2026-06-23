@@ -17,6 +17,9 @@ def parse_args():
     parser.add_argument("--endpoint", default="http://localhost:1234/v1", help="OpenAI-compatible API endpoint (default: LM Studio's localhost:1234/v1)")
     parser.add_argument("--api-key", default=None, help="API Key for the endpoint. Evaluated as: 1) value provided, 2) LM_STUDIO_API_KEY environment variable, 3) no Bearer token (no bearer authorization required).")
     parser.add_argument("--model", default="local-model", help="Model name to request from the API (LM Studio usually ignores this but API needs it)")
+    parser.add_argument("--context-length", type=int, default=2048, help="Context window size to request during JIT load. Drastically reduces VRAM. (default: 2048)")
+    parser.add_argument("--cooldown", type=float, default=1.5, help="Artificial delay (in seconds) between LLM calls to prevent GPU overheating/BSODs (default: 1.5)")
+    parser.add_argument("--temperature", type=float, default=0.1, help="LLM Temperature (creativity). Lower is more strict, higher is more creative. (default: 0.1)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose debug logging")
     return parser.parse_args()
 
@@ -27,29 +30,32 @@ def parse_time(time_str):
     else:
         return float(time_str.replace('s', ''))
 
-def condense_text(client, model, original_text, target_chars):
+def condense_text(client, model, original_text, target_chars, temperature=0.1):
     system_prompt = (
         "You are an expert dubbing scriptwriter. Your job is to rewrite Portuguese subtitles "
         "to be shorter, punchier, and faster to speak, without losing the core meaning. "
         "You must strictly obey the character limit provided. OUTPUT ONLY THE CONDENSED TEXT. "
-        "Do not output conversational filler, introductions, quotes, or explanations."
+        "Do not output conversational filler, introductions, quotes, or explanations. "
+        "CRITICAL RULE: You must output STRICTLY in Portuguese. Do not output any Chinese characters, pinyin, or translation notes."
     )
     user_prompt = f"Condense the following text to be strictly under {int(target_chars)} characters:\n\n{original_text}"
     
     try:
+        logging.debug(f"Sending request to LLM...")
         response = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.1,
+            temperature=temperature,
             max_tokens=300,
         )
         condensed = response.choices[0].message.content.strip()
         # Clean up accidental quotes if the model added them
         if condensed.startswith('"') and condensed.endswith('"'):
             condensed = condensed[1:-1]
+        logging.debug(f"Condensed text from LLM: {condensed}")
         return condensed
     except Exception as e:
         logging.error(f"Failed to condense text: {e}")
@@ -80,7 +86,11 @@ def main():
             client.chat.completions.create(
                 model=args.model,
                 messages=[{"role": "user", "content": "warmup"}],
-                max_tokens=1
+                max_tokens=1,
+                extra_body={
+                    "context_length": args.context_length,
+                    "n_ctx": args.context_length
+                }
             )
             logging.info(f"Model '{args.model}' successfully loaded into VRAM.")
         else:
@@ -95,7 +105,11 @@ def main():
         sys.exit(1)
 
     # Robust pattern matching both '00:00:00.000 --> 00:00:00.000' and '000.57s - 001.51s'
-    pattern = re.compile(r'^\[([\d:.]+)s?\s*(?:-->|-)\s*([\d:.]+)s?\](?:.*?:\s*)?(.*)$')
+    # Group 1: The entire prefix (e.g. "[000.57s - 001.51s] Speaker SPEAKER_01: ")
+    # Group 2: Start time string
+    # Group 3: End time string
+    # Group 4: The text to be translated
+    pattern = re.compile(r'^(\[([\d:.]+)s?\s*(?:-->|-)\s*([\d:.]+)s?\](?:.*?:\s*)?)(.*)$')
     
     lines_processed = 0
     condensed_count = 0
@@ -109,45 +123,69 @@ def main():
         
         logging.info("Starting text condensation pass...")
         
-        for line in infile:
-            match = pattern.match(line.strip())
-            if not match:
-                # Keep unrecognized lines intact (empty lines, headers)
-                outfile.write(line + "\n" if not line.endswith("\n") else line)
-                continue
+        buffered_prefix = None
+        buffered_start_str = None
+        buffered_end_str = None
+        buffered_text = ""
+        buffered_duration = 0
+        
+        def flush_buffer():
+            nonlocal lines_processed, condensed_count, total_chars_saved
+            if buffered_prefix is None:
+                return
                 
-            start_str, end_str, text = match.groups()
-            duration = parse_time(end_str) - parse_time(start_str)
-            logging.debug(f"Processing line: {text} duration: {duration}")
+            text = buffered_text.strip()
+            target_char_limit = buffered_duration * args.max_chars_per_sec
             
-            if duration <= 0:
-                outfile.write(line + "\n")
-                continue
-                
-            target_char_limit = duration * args.max_chars_per_sec
-            
-            if len(text) > target_char_limit:
-                logging.debug(f"[{start_str} - {end_str}] Too long ({len(text)} > {int(target_char_limit)}). Condensing...")
+            if buffered_duration > 0 and len(text) > target_char_limit:
+                logging.debug(f"[{buffered_start_str} - {buffered_end_str}] Too long ({len(text)} > {int(target_char_limit)}). Condensing...")
                 
                 llm_t0 = time.time()
-                condensed = condense_text(client, args.model, text, target_char_limit)
+                condensed = condense_text(client, args.model, text, target_char_limit, args.temperature)
                 llm_call_times.append(time.time() - llm_t0)
+                
+                if args.cooldown > 0:
+                    logging.debug(f"  Cooling down for {args.cooldown}s to protect hardware...")
+                    time.sleep(args.cooldown)
                 
                 if len(condensed) < len(text):
                     total_chars_saved += (len(text) - len(condensed))
                     condensed_count += 1
-                    logging.debug(f"  Original : {text}")
-                    logging.debug(f"  Condensed: {condensed} ({len(condensed)} chars)")
+                    logging.info(f"  Original : {text}")
+                    logging.info(f"  Condensed: {condensed} ({len(condensed)} chars)")
                     
-                    # Reconstruct the line
-                    outfile.write(f"[{start_str} --> {end_str}] {condensed}\n")
+                    # Convert any inner newlines from the model to spaces for a clean single-line output
+                    condensed_single_line = condensed.replace('\n', ' ')
+                    outfile.write(f"{buffered_prefix}{condensed_single_line}\n")
                 else:
-                    logging.debug("  LLM failed to shorten text. Keeping original.")
-                    outfile.write(line + "\n" if not line.endswith("\n") else line)
+                    logging.warning("  LLM failed to shorten text (new size is bigger than original sentence). Keeping original.")
+                    outfile.write(f"{buffered_prefix}{text}\n")
             else:
-                outfile.write(line + "\n" if not line.endswith("\n") else line)
+                outfile.write(f"{buffered_prefix}{text}\n")
                 
             lines_processed += 1
+
+        for line in infile:
+            stripped = line.strip()
+            if not stripped:
+                continue
+                
+            match = pattern.match(stripped)
+            if match:
+                flush_buffer()
+                buffered_prefix, buffered_start_str, buffered_end_str, text_part = match.groups()
+                buffered_text = text_part
+                buffered_duration = parse_time(buffered_end_str) - parse_time(buffered_start_str)
+            else:
+                if buffered_prefix is not None:
+                    # Append continuation line
+                    buffered_text += " " + stripped
+                else:
+                    # Header/unrecognized line before any timestamps begin
+                    outfile.write(line + "\n" if not line.endswith("\n") else line)
+                    
+        # Flush the final block
+        flush_buffer()
 
     total_time = time.time() - global_start_time
 
