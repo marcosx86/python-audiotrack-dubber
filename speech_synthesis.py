@@ -11,6 +11,7 @@ import argparse
 import tempfile
 import subprocess
 from pathlib import Path
+from num2words import num2words
 
 import torch
 import torchaudio
@@ -133,6 +134,21 @@ def parse_transcriptions(orig_path, trans_path):
                         "trans_text": trans_text
                     })
     return segments
+
+def normalize_portuguese_text(text):
+    """
+    Finds all digits in the string and replaces them with their Portuguese word equivalent
+    using num2words. Helps avoid CosyVoice falling back to English normalization.
+    """
+    def replace_num(match):
+        num_str = match.group()
+        try:
+            return num2words(int(num_str), lang='pt_BR')
+        except:
+            return num_str
+
+    # Replace digits with their Portuguese word equivalents
+    return re.sub(r'\d+', replace_num, text)
 
 def audio_extractor_worker(task_queue, segments, original_audio, ffmpeg_path):
     """
@@ -264,6 +280,9 @@ def main():
         duration = seg['duration']
         orig_text = seg['orig_text']
         trans_text = seg['trans_text']
+        
+        # Normalize text to Portuguese before processing
+        trans_text = normalize_portuguese_text(trans_text)
         
         logging.info(f"[{idx+1}/{len(segments)}] Synthesizing clip: [{start:.2f}s - {end:.2f}s]")
         logging.debug(f"[Consumer] Waited {wait_time:.3f}s for Producer queue")
