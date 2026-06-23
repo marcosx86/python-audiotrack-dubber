@@ -6,6 +6,7 @@ import shutil
 import logging
 import threading
 import queue
+import time
 import argparse
 import tempfile
 import subprocess
@@ -99,12 +100,13 @@ def audio_extractor_worker(task_queue, segments, original_audio, ffmpeg_path):
     Places a dict containing the segment data and the temporary wav path into the queue.
     """
     for idx, seg in enumerate(segments):
-        start = seg['start']
+        seg_start = seg['start']
         duration = seg['duration']
         
         try:
+            t0 = time.time()
             # Extract at 16kHz for CosyVoice prompts
-            wav_path = extract_reference_audio(original_audio, start, duration, ffmpeg_path, target_sr=16000)
+            wav_path = extract_reference_audio(original_audio, seg_start, duration, ffmpeg_path, target_sr=16000)
             
             # Block if the queue is full (maxsize reached)
             task_queue.put({
@@ -113,6 +115,7 @@ def audio_extractor_worker(task_queue, segments, original_audio, ffmpeg_path):
                 'wav_path': wav_path,
                 'error': None
             })
+            logging.debug(f"[Producer] Extracted segment {idx+1} in {time.time() - t0:.3f}s (Queue size: {task_queue.qsize()})")
         except Exception as e:
             # Pass the error down the queue so the main thread can handle/log it safely
             task_queue.put({
@@ -205,10 +208,12 @@ def main():
     logging.info("Starting zero-shot TTS generation...")
 
     while True:
+        wait_t0 = time.time()
         task = task_queue.get()
         if task is None:
             break # All segments processed
             
+        wait_time = time.time() - wait_t0
         idx = task['idx']
         seg = task['seg']
         reference_audio_path = task['wav_path']
@@ -221,6 +226,7 @@ def main():
         trans_text = seg['trans_text']
         
         logging.info(f"[{idx+1}/{len(segments)}] Synthesizing clip: [{start:.2f}s - {end:.2f}s]")
+        logging.debug(f"[Consumer] Waited {wait_time:.3f}s for Producer queue")
         logging.debug(f"  Reference Text: {orig_text}")
         logging.debug(f"  Target Text:    {trans_text}")
 
@@ -240,7 +246,8 @@ def main():
         # 2. Generate Audio
         try:
             # cosyvoice.inference_zero_shot returns either a dictionary or a generator
-            logging.debug(f"Calling cosyvoice.inference_zero_shot...")
+            logging.debug(f"[Consumer] Calling cosyvoice.inference_zero_shot...")
+            infer_t0 = time.time()
             output = cosyvoice.inference_zero_shot(
                 tts_text=trans_text,
                 prompt_text=orig_text,
@@ -249,14 +256,18 @@ def main():
             
             # If it yields chunks (streaming), concatenate them
             if hasattr(output, '__iter__') and not isinstance(output, dict):
-                logging.debug(f"Output has multiple chunks, going to GPU for concatenation.")
+                logging.debug(f"[Consumer] Output is generator, awaiting GPU chunks...")
                 tts_speech = torch.cat([chunk['tts_speech'] for chunk in output], dim=1)
             else:
-                logging.debug(f"Output has single chunk, assigning...")
+                logging.debug(f"[Consumer] Output has single chunk, assigning...")
                 tts_speech = output['tts_speech']
 
+            infer_time = time.time() - infer_t0
+            logging.debug(f"[Consumer] Finished inference and concatenation in {infer_time:.3f}s")
+            
+            cpu_t0 = time.time()
             final_audio_pieces.append(tts_speech.cpu())
-            logging.debug(f"Copied processed tensor (audio fragment) to CPU")
+            logging.debug(f"[Consumer] Copied processed tensor to CPU in {time.time() - cpu_t0:.3f}s")
             
             # 3. Advance timeline by the EXACT duration of the generated audio
             generated_dur = tts_speech.shape[1] / target_sr
