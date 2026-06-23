@@ -1,15 +1,12 @@
-import logging
 import os
 import sys
 import re
+import shutil
 import logging
 import argparse
 import tempfile
 import subprocess
 from pathlib import Path
-
-sys.path.append('../CosyVoice')
-sys.path.append('../CosyVoice/third_party/Matcha-TTS')
 
 import torch
 import torchaudio
@@ -25,8 +22,7 @@ def parse_args():
     parser.add_argument("translated_transcription", help="Path to the translated transcription text file")
     
     # Model configuration
-    parser.add_argument("--model-dir", required=True, help="Path to the CosyVoice model directory")
-    parser.add_argument("--gguf-file", required=True, help="Path to the quantized .gguf file for the LLM step")
+    parser.add_argument("--model-dir", required=True, help="Path to the CosyVoice model directory (e.g. D:\\CosyVoice\\pretrained_models\\CosyVoice2-0.5B)")
     
     # Output configuration
     parser.add_argument("--output-file", "-o", default="translated_output.wav", help="Path to save the final synthesized audio")
@@ -36,8 +32,8 @@ def parse_args():
 
 def extract_reference_audio(audio_path, start, duration, ffmpeg_path, target_sr=16000):
     """
-    Extracts a segment of audio using FFmpeg and returns a 16kHz torch tensor.
-    Using FFmpeg avoids loading the entire source video/audio into RAM.
+    Extracts a segment of audio using FFmpeg and returns the path to a 16kHz temporary wav file.
+    The caller is responsible for deleting the file after use.
     """
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_name = tmp.name
@@ -52,14 +48,9 @@ def extract_reference_audio(audio_path, start, duration, ffmpeg_path, target_sr=
         "-ar", str(target_sr),
         tmp_name
     ]
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        waveform, sr = torchaudio.load(tmp_name)
-    finally:
-        if os.path.exists(tmp_name):
-            os.remove(tmp_name)
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             
-    return waveform
+    return tmp_name
 
 def parse_transcriptions(orig_path, trans_path):
     """
@@ -106,8 +97,19 @@ def main():
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level, format="%(asctime)s - [%(levelname)s] - %(message)s")
 
+    # Fix Windows DLL loading for torchcodec (FFmpeg shared binaries)
+    if sys.platform == "win32":
+        ffmpeg_exe = shutil.which(args.ffmpeg_path)
+        if ffmpeg_exe:
+            ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+            try:
+                os.add_dll_directory(ffmpeg_dir)
+                logging.debug(f"Automatically registered FFmpeg DLL directory: {ffmpeg_dir}")
+            except Exception as e:
+                logging.warning(f"Failed to register DLL directory {ffmpeg_dir}: {e}")
+
     # Verify input files
-    for path in [args.original_audio, args.original_transcription, args.translated_transcription, args.gguf_file]:
+    for path in [args.original_audio, args.original_transcription, args.translated_transcription]:
         if not Path(path).is_file():
             logging.error(f"File not found: {path}")
             sys.exit(1)
@@ -127,23 +129,25 @@ def main():
     # Lazy-load CosyVoice to avoid failing fast on arg checks
     logging.debug("Loading CosyVoice modules...")
     try:
-        # Add model dir to path in case they are running from a cloned repo structure
-        sys.path.append(args.model_dir) 
-        from cosyvoice.cli.cosyvoice import CosyVoice, AutoModel
+        # Add model dir and its third_party dependencies to path
+        # Assuming the script runs from WhisperX but model_dir might be D:\CosyVoice\pretrained_models\...
+        # We need the base CosyVoice repo path to import correctly.
+        base_cosyvoice_dir = str(Path(args.model_dir).parent.parent) # D:\CosyVoice
+        sys.path.append(base_cosyvoice_dir)
+        sys.path.append(os.path.join(base_cosyvoice_dir, 'third_party', 'Matcha-TTS'))
+        
+        from cosyvoice.cli.cosyvoice import AutoModel
     except ImportError as e:
         logging.error(f"Failed to import CosyVoice. Ensure you have the library installed. Error: {e}")
         sys.exit(1)
         
-    logging.info(f"Initializing CosyVoice with GGUF model: {args.gguf_file}")
+    logging.info(f"Initializing CosyVoice AutoModel with model: {args.model_dir}")
     
-    # The exact initialization parameters depend on the specific llama.cpp fork of CosyVoice
-    # Sketching it based on standard approaches:
     try:
-        # cosyvoice = CosyVoice(args.model_dir, gguf_path=args.gguf_file)
         cosyvoice = AutoModel(model_dir=args.model_dir)
-    except TypeError:
-        logging.warning("CosyVoice init didn't accept gguf_path directly. Falling back to default init.")
-        cosyvoice = CosyVoice(args.model_dir)
+    except Exception as e:
+        logging.error(f"Failed to initialize CosyVoice: {e}")
+        sys.exit(1)
 
     target_sr = 22050  # Typical CosyVoice sample rate, updated below if model has it
     if hasattr(cosyvoice, 'sample_rate'):
@@ -174,19 +178,16 @@ def main():
             current_time = start
 
         # 2. Extract Reference Audio at 16kHz for prompt
+        reference_audio_path = None
         try:
-            reference_audio = extract_reference_audio(args.original_audio, start, duration, args.ffmpeg_path, target_sr=16000)
-        except Exception as e:
-            logging.error(f"  Failed to extract reference audio: {e}")
-            sys.exit(1)
+            reference_audio_path = extract_reference_audio(args.original_audio, start, duration, args.ffmpeg_path, target_sr=16000)
 
-        # 3. Generate Audio
-        try:
+            # 3. Generate Audio
             # cosyvoice.inference_zero_shot returns either a dictionary or a generator
             output = cosyvoice.inference_zero_shot(
                 tts_text=trans_text,
                 prompt_text=orig_text,
-                prompt_wav=reference_audio
+                prompt_wav=reference_audio_path
             )
             
             # If it yields chunks (streaming), concatenate them
@@ -206,6 +207,9 @@ def main():
             logging.error(f"  TTS generation failed for segment {idx+1}: {e}")
             logging.warning("  Skipping this segment to continue pipeline.")
             continue
+        finally:
+            if reference_audio_path and os.path.exists(reference_audio_path):
+                os.remove(reference_audio_path)
 
     # Assemble and save
     logging.info("Concatenating all segments and silence buffers...")

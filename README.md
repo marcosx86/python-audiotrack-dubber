@@ -12,7 +12,7 @@ This project provides a robust, two-step pipeline for extracting high-quality au
 
 ## Workflow
 
-The pipeline consists of two main scripts:
+The pipeline consists of four main scripts:
 
 ### 1. `transcribe.py`
 
@@ -46,6 +46,46 @@ python extract_segments.py transcript.txt media.mp4 --target-speaker SPEAKER_01 
 *(Check `python extract_segments.py --help` for a full list of arguments.)*
 
 ## Output Artifacts
+
+Running the pipeline will generate several assets across its steps:
+
+- `segments/`: A folder containing all the individual `.wav` clips extracted from the source (from `extract_segments.py`).
+- `concat.txt`: The FFmpeg concatenation file list.
+- `narrator_reference.wav`: The final concatenated audio file containing only the target speaker.
+- `narrator_reference.txt`: A companion text file mapping the concatenated audio's new continuous timestamps to the spoken text.
+- `<transcript_name>_<target_lang>.txt`: The fully translated transcription file keeping original timestamps intact.
+- `translated_output.wav`: The final, fully synthesized translated audio track matching the absolute timeline of the original video.
+
+### 3. `translate_transcription.py`
+
+Translates the text of a WhisperX transcription file into a target language while preserving the timeline timestamps and speaker tags perfectly intact.
+
+**Key Features:**
+- **Local AI Engine**: Uses `CTranslate2` models and `AutoTokenizer` for offline, fast, and VRAM-efficient batch translation.
+- **Language Query**: Includes a `--list-languages` parameter for easily querying common FLORES-200 target languages in the terminal.
+- **Timeline Preservation**: Separates the timestamp (`[0.00s - 1.80s]`) prefix from text so translations drop perfectly back into the original timeline.
+
+**Usage Example:**
+```bash
+python translate_transcription.py transcript.txt --model-dir path/to/nllb-model --target-lang por_Latn --compute-type int8
+```
+*(Check `python translate_transcription.py --help` for a full list of arguments.)*
+
+### 4. `speech_synthesis.py`
+
+Synthesizes the translated text back into audio using the `CosyVoice` zero-shot TTS engine, aiming to emulate the pacing and tone of the original speaker, matched seamlessly to the original timestamps.
+
+**Key Features:**
+- **Dynamic Timeline Alignment**: Reads both original and translated transcriptions simultaneously. If the translation requires more or less time to speak, the script computes and pads exact silence gaps so the next sentence starts precisely at its original absolute timestamp.
+- **RAM-Efficient Audio Slicing**: Uses `torchaudio` combined with an `ffmpeg` subprocess to slice only the required reference context directly from the full source file, converting it to a 16kHz prompt on the fly.
+- **AutoModel Integration**: Natively supports `CosyVoice`, `CosyVoice2`, and `CosyVoice3` via dynamic factory initialization.
+- **DLL Auto-Fixer**: Automatically detects your global `ffmpeg.exe` and securely registers its directory to bypass `torchcodec` DLL load errors on Windows.
+
+**Usage Example:**
+```bash
+python .\speech_synthesis.py --ffmpeg-path C:/PATH_TO_FFMPEG_SHARED/bin/ffmpeg.exe --model-dir /COSYVOICE_MODELS/CosyVoice2-0.5B ORIGINAL_AUDIO.mp4 ORIGINAL_TRANSCRIPTION.txt TRANSLATED_TRANSCRIPTION.txt
+```
+*(Check `python speech_synthesis.py --help` for a full list of arguments.)*
 
 Running `extract_segments.py` will create an output directory (default: `voice_extract`) containing:
 - `segments/`: A folder containing all the individual `.wav` clips extracted from the source.
