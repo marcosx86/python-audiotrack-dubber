@@ -23,7 +23,7 @@ To successfully replicate this exact pipeline, the following major dependencies 
 
 ## Workflow
 
-The pipeline consists of five main scripts:
+The pipeline consists of six main scripts:
 
 ### 1. `transcribe.py`
 
@@ -98,23 +98,48 @@ python condense_transcription.py --output-file condensed_translation.txt --model
 ```
 *(Check `python condense_transcription.py --help` for a full list of arguments.)*
 
-### 5. `speech_synthesis.py`
+### 5. `transcription2srt.py`
 
-Synthesizes the translated text back into audio using the `CosyVoice` zero-shot TTS engine, aiming to emulate the pacing and tone of the original speaker, matched seamlessly to the original timestamps.
+A lightweight QA utility that converts WhisperX transcription files (both original and LLM-condensed) into standard `.srt` subtitle files. This allows you to visually verify translation lengths and scene timing in a media player before committing to the heavy TTS generation phase.
+
+**Usage Example:**
+```bash
+python transcription2srt.py condensed_translation.txt
+```
+
+### 6. Speech Synthesis (Dual Engine)
+
+As a research-driven project, this pipeline supports two powerful zero-shot TTS engines depending on your target language's native support requirements. Both scripts share the exact same highly-optimized architecture (asynchronous FFmpeg extraction, strict timeline synchronization, and `atempo` time-stretching).
+
+#### 6.1. `xttsv2_speech_synthesis.py` (Primary: Brazilian Portuguese)
+
+Synthesizes the translated text back into audio using the **Coqui XTTS-v2** zero-shot TTS engine. This engine is the primary default due to its robust native training on Brazilian Portuguese (`pt-br`), successfully avoiding the foreign-accent bleeding common in heavily Chinese/English-weighted models.
 
 **Key Features:**
+- **Native Portuguese Phonology**: Uses Coqui XTTS-v2 for flawless, accent-free Brazilian Portuguese voice cloning.
 - **Asynchronous Extraction**: Implements a Producer-Consumer threading architecture with a managed queue, allowing CPU-bound FFmpeg audio slicing to pre-fetch perfectly in parallel with GPU-bound LLM generation.
-- **Strict Timeline & Time-Stretching**: Enforces absolute synchronization to the original video by dynamically applying FFmpeg's `atempo` time-stretch filter to squeeze generated audio if it exceeds its original timestamp window.
-- **Robust Text Normalization**: Intercepts numbers and normalizes them into localized Portuguese words using NVIDIA's `nemo_text_processing`, safely bypassing CosyVoice's default English normalization (`wetext`) for unsupported languages.
-- **Hardware Optimized**: Includes `--fp16` support to slash memory bandwidth overhead and maximize GPU utilization during standard PyTorch autoregressive inference loops.
-- **AutoModel Integration**: Natively supports `CosyVoice`, `CosyVoice2`, and `CosyVoice3` via dynamic factory initialization.
+- **Strict Timeline & Time-Stretching**: Enforces absolute synchronization to the original video by dynamically applying FFmpeg's `atempo` time-stretch filter to squeeze generated audio if it exceeds its strict timestamp window.
+- **Robust Text Normalization**: Intercepts numbers and normalizes them into localized Portuguese words using NVIDIA's `nemo_text_processing` prior to audio generation.
 - **DLL Auto-Fixer**: Automatically registers your global `ffmpeg.exe` directory to cleanly bypass `torchcodec` load errors on Windows Python 3.8+.
 
 **Usage Example:**
 ```bash
-python .\speech_synthesis.py --ffmpeg-path C:/PATH_TO_FFMPEG_SHARED/bin/ffmpeg.exe --model-dir /COSYVOICE_MODELS/CosyVoice2-0.5B ORIGINAL_AUDIO.mp4 ORIGINAL_TRANSCRIPTION.txt TRANSLATED_TRANSCRIPTION.txt
+python .\xttsv2_speech_synthesis.py ORIGINAL_AUDIO.mp4 ORIGINAL_TRANSCRIPTION.txt TRANSLATED_TRANSCRIPTION.txt --ffmpeg-path C:/PATH_TO_FFMPEG_SHARED/bin/ffmpeg.exe --time-stretch
 ```
-*(Check `python speech_synthesis.py --help` for a full list of arguments.)*
+
+#### 6.2. `cosyvoice_speech_synthesis.py` (Secondary: Alibaba Ecosystem)
+
+Synthesizes the translated text back into audio using the `CosyVoice` zero-shot TTS engine. This is ideal for languages natively supported by Alibaba's ecosystem (e.g., Chinese, English, Japanese, Korean) where the acoustic model has deep phonetic knowledge.
+
+**Key Features:**
+- **AutoModel Integration**: Natively supports `CosyVoice`, `CosyVoice2`, and `CosyVoice3` via dynamic factory initialization.
+- **Hardware Optimized**: Includes `--fp16` support to slash memory bandwidth overhead and maximize GPU utilization during standard PyTorch autoregressive inference loops.
+- **Identical Pipeline Architecture**: Shares the same Producer-Consumer queue, NeMo normalization bypass (to prevent `wetext` crashes), and strict FFmpeg time-stretching as the XTTS-v2 variant.
+
+**Usage Example:**
+```bash
+python .\cosyvoice_speech_synthesis.py --ffmpeg-path C:/PATH_TO_FFMPEG_SHARED/bin/ffmpeg.exe --model-dir /COSYVOICE_MODELS/CosyVoice2-0.5B ORIGINAL_AUDIO.mp4 ORIGINAL_TRANSCRIPTION.txt TRANSLATED_TRANSCRIPTION.txt --time-stretch
+```
 
 Running `extract_segments.py` will create an output directory (default: `voice_extract`) containing:
 - `segments/`: A folder containing all the individual `.wav` clips extracted from the source.

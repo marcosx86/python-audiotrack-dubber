@@ -12,15 +12,6 @@ import subprocess
 from pathlib import Path
 import statistics
 
-import torch
-import torchaudio
-from nemo_text_processing.text_normalization.normalize import Normalizer
-
-from TTS.api import TTS
-from TTS.tts.configs.xtts_config import XttsConfig
-from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
-from TTS.config.shared_configs import BaseDatasetConfig
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Synthesize translated audio using Coqui XTTS-v2.",
@@ -229,6 +220,17 @@ def main():
         sys.exit(1)
         
     logging.info(f"Loaded and sliced {len(segments)} segments for synthesis.")
+
+    # Loading heavy modules after our argparse intro
+    logging.debug("Loading heavy modules (torch, torchaudio, nemo_text_processing, TTS)...")
+    import torch
+    import torchaudio
+    from nemo_text_processing.text_normalization.normalize import Normalizer
+
+    from TTS.api import TTS
+    from TTS.tts.configs.xtts_config import XttsConfig
+    from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
+    from TTS.config.shared_configs import BaseDatasetConfig
 
     # Tell PyTorch to trust the XTTS config class (fixes deserialization security errors)
     torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, XttsArgs, BaseDatasetConfig])
