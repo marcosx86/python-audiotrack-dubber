@@ -117,8 +117,10 @@ Synthesizes the translated text back into audio using the **Coqui XTTS-v2** zero
 
 **Key Features:**
 - **Native Portuguese Phonology**: Uses Coqui XTTS-v2 for flawless, accent-free Brazilian Portuguese voice cloning.
+- **Global Voice Latents**: Optional `--reference-audio-path` bypasses dynamic per-segment FFmpeg extraction, computing zero-shot speaker embeddings globally at startup to dramatically increase inference speed and enforce absolute voice consistency.
 - **Asynchronous Extraction**: Implements a Producer-Consumer threading architecture with a managed queue, allowing CPU-bound FFmpeg audio slicing to pre-fetch perfectly in parallel with GPU-bound LLM generation.
 - **Strict Timeline & Time-Stretching**: Enforces absolute synchronization to the original video by dynamically applying FFmpeg's `atempo` time-stretch filter to squeeze generated audio if it exceeds its strict timestamp window.
+- **Hardware Protection**: Includes a `--cooldown` parameter to pace the heavy zero-shot TTS generation loop and prevent thermal throttling.
 - **Robust Text Normalization**: Intercepts numbers and normalizes them into localized Portuguese words using NVIDIA's `nemo_text_processing` prior to audio generation.
 - **DLL Auto-Fixer**: Automatically registers your global `ffmpeg.exe` directory to cleanly bypass `torchcodec` load errors on Windows Python 3.8+.
 

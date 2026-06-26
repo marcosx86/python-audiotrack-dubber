@@ -28,10 +28,12 @@ def parse_args():
     
     # Output configuration
     parser.add_argument("--output-file", "-o", default="translated_output.wav", help="Path to save the final synthesized audio")
+    parser.add_argument("--reference-audio-path", default=None, help="Path to a single clean reference audio file (e.g. narrator_reference.wav) to extract global latents from, bypassing dynamic per-segment extraction.")
     parser.add_argument("--ffmpeg-path", default="ffmpeg", help="Custom path to the ffmpeg executable")
     parser.add_argument("--time-stretch", action="store_true", help="Enable FFmpeg time-stretching (condensation) to force generated audio to fit original timestamps")
     parser.add_argument("--start-sentence", type=int, default=None, help="1-indexed starting sentence to generate (inclusive)")
     parser.add_argument("--end-sentence", type=int, default=None, help="1-indexed ending sentence to generate (inclusive)")
+    parser.add_argument("--cooldown", type=float, default=1.5, help="Artificial delay (in seconds) between LLM calls to prevent GPU overheating/BSODs (default: 1.5)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose debug logging")
     return parser.parse_args()
 
@@ -148,7 +150,7 @@ def parse_transcriptions(orig_path, trans_path):
         
     return results
 
-def audio_extractor_worker(task_queue, segments, original_audio, ffmpeg_path):
+def audio_extractor_worker(task_queue, segments, original_audio, ffmpeg_path, skip_extraction=False):
     """
     Background worker that extracts audio segments via FFmpeg ahead of time.
     Places a dict containing the segment data and the temporary wav path into the queue.
@@ -158,9 +160,13 @@ def audio_extractor_worker(task_queue, segments, original_audio, ffmpeg_path):
         duration = seg['duration']
         
         try:
-            t0 = time.time()
-            # Extract at 24kHz for XTTSv2 prompt matching
-            wav_path = extract_reference_audio(original_audio, seg_start, duration, ffmpeg_path, target_sr=24000)
+            if skip_extraction:
+                wav_path = None
+            else:
+                t0 = time.time()
+                # Extract at 24kHz for XTTSv2 prompt matching
+                wav_path = extract_reference_audio(original_audio, seg_start, duration, ffmpeg_path, target_sr=24000)
+                logger.debug(f"[Producer] Extracted segment {idx+1} in {time.time() - t0:.3f}s (Queue size: {task_queue.qsize()})")
             
             # Block if the queue is full (maxsize reached)
             task_queue.put({
@@ -169,7 +175,6 @@ def audio_extractor_worker(task_queue, segments, original_audio, ffmpeg_path):
                 'wav_path': wav_path,
                 'error': None
             })
-            logger.debug(f"[Producer] Extracted segment {idx+1} in {time.time() - t0:.3f}s (Queue size: {task_queue.qsize()})")
         except Exception as e:
             # Pass the error down the queue so the main thread can handle/log it safely
             task_queue.put({
@@ -207,7 +212,8 @@ def main():
 
     start_idx = max(0, args.start_sentence - 1) if args.start_sentence is not None else 0
     end_idx = args.end_sentence if args.end_sentence is not None else len(segments)
-    
+    is_trimmed = args.start_sentence is not None or args.end_sentence is not None
+
     # Store global offset to maintain proper logging ID numbers
     global_offset = start_idx
     segments = segments[start_idx:end_idx]
@@ -259,6 +265,22 @@ def main():
         logger.error(f"Failed to initialize XTTS-v2: {e}")
         sys.exit(1)
 
+    global_gpt_cond_latent = None
+    global_speaker_embedding = None
+    if args.reference_audio_path:
+        if not Path(args.reference_audio_path).is_file():
+            logger.error(f"Reference audio not found: {args.reference_audio_path}")
+            sys.exit(1)
+        logger.info(f"Computing global voice latents from: {args.reference_audio_path}")
+        try:
+            global_gpt_cond_latent, global_speaker_embedding = xtts.get_conditioning_latents(
+                audio_path=[args.reference_audio_path],
+                gpt_cond_len=30,
+            )
+        except Exception as e:
+            logger.error(f"Failed to compute global latents: {e}")
+            sys.exit(1)
+
     logger.info("Initializing NeMo Text Normalizer for pt_BR...")
     try:
         nemo_normalizer = Normalizer(input_case='cased', lang='pt')
@@ -273,7 +295,7 @@ def main():
     
     extractor_thread = threading.Thread(
         target=audio_extractor_worker,
-        args=(task_queue, segments, args.original_audio, args.ffmpeg_path),
+        args=(task_queue, segments, args.original_audio, args.ffmpeg_path, bool(args.reference_audio_path)),
         daemon=True
     )
     logger.info("Starting background audio extraction thread...")
@@ -313,12 +335,12 @@ def main():
         except Exception as e:
             logger.warning(f"NeMo normalization failed for '{trans_text}'. Using original text. Error: {e}")
         
-        logger.info(f"[{global_offset + idx + 1}/{global_offset + len(segments)} (Trimmed)] Synthesizing clip: [{start:.2f}s - {end:.2f}s]")
+        logger.info(f"[{global_offset + idx + 1}/{global_offset + len(segments)}{' (Trimmed)' if is_trimmed else ''}] Synthesizing clip: [{start:.2f}s - {end:.2f}s]")
         logger.debug(f"[Consumer] Waited {wait_time:.3f}s for Producer queue")
         logger.debug(f"  Reference Text: {orig_text}")
         logger.debug(f"  Normalized Text:    {trans_text}")
 
-        if extract_error:
+        if extract_error and not args.reference_audio_path:
             logger.error(f"  Failed to extract reference audio: {extract_error}")
             logger.warning("  Skipping this segment to continue pipeline.")
             continue
@@ -333,14 +355,18 @@ def main():
 
         # 2. Generate Audio
         try:
-            logger.debug(f"[Consumer] Computing voice latents from reference audio...")
-            infer_t0 = time.time()
+            if global_gpt_cond_latent is not None:
+                gpt_cond_latent = global_gpt_cond_latent
+                speaker_embedding = global_speaker_embedding
+            else:
+                logger.debug(f"[Consumer] Computing voice latents from reference audio...")
+                # Compute latents from dynamically extracted prompt audio
+                gpt_cond_latent, speaker_embedding = xtts.get_conditioning_latents(
+                    audio_path=[reference_audio_path],
+                    gpt_cond_len=30, # Max conditioning length is 30s
+                )
             
-            # Compute latents from prompt audio
-            gpt_cond_latent, speaker_embedding = xtts.get_conditioning_latents(
-                audio_path=[reference_audio_path],
-                gpt_cond_len=30, # Max conditioning length is 30s
-            )
+            infer_t0 = time.time()
             
             logger.debug(f"[Consumer] Calling xtts.inference...")
             out = xtts.inference(
@@ -353,7 +379,11 @@ def main():
 
             infer_time = time.time() - infer_t0
             logger.debug(f"[Consumer] Finished inference in {infer_time:.3f}s")
-            
+
+            if args.cooldown > 0:
+                logging.debug(f"[Consumer] Cooling down for {args.cooldown}s to protect hardware...")
+                time.sleep(args.cooldown)
+
             cpu_t0 = time.time()
             # Convert NumPy array to PyTorch tensor and add channel dimension
             tts_speech = torch.from_numpy(out["wav"]).unsqueeze(0)
@@ -377,7 +407,7 @@ def main():
                     # 3b. Accept timeline drift (Condensation disabled)
                     final_audio_pieces.append(tts_speech)
                     current_time += generated_dur
-                    logger.debug(f"  Timeline drifted to {current_time:.2f}s (overshot by {generated_dur - target_dur:.2f}s).")
+                    logger.warning(f"  Timeline drifted to {current_time:.2f}s (overshot by {generated_dur - target_dur:.2f}s).")
             else:
                 # 3c. Pad with silence if it's shorter than strict window
                 final_audio_pieces.append(tts_speech)
@@ -390,8 +420,9 @@ def main():
                 logger.debug(f"  Timeline strictly advanced to {current_time:.2f}s.")
             # --- END TIMELINE MODEL ---
 
-            segment_processing_times.append(time.time() - segment_t0)
-
+            segment_processing_time = time.time() - segment_t0
+            segment_processing_times.append(segment_processing_time)
+            logger.info(f"  Segment {idx+1} processed in {segment_processing_time:.2f}s")
         except Exception as e:
             logger.error(f"  TTS generation failed for segment {idx+1}: {e}")
             logger.warning("  Skipping this segment to continue pipeline.")
