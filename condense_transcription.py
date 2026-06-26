@@ -46,9 +46,12 @@ def generate_abstract(client, model, abstract_text, temperature=0.1):
                 {"role": "user", "content": user_prompt}
             ],
             temperature=temperature,
-            max_tokens=150,
+            max_tokens=2048,
         )
         abstract = response.choices[0].message.content.strip()
+        # Automatically strip reasoning blocks if a DeepSeek R1 model is used
+        abstract = re.sub(r'<think>.*?</think>', '', abstract, flags=re.DOTALL).strip()
+        
         logging.info(f"Generated Global Abstract: {abstract}")
         return abstract
     except Exception as e:
@@ -73,6 +76,7 @@ def condense_text(client, model, original_text, target_chars, temperature=0.1, m
             "- Prefer shorter and more common words.\n"
             "- Remove redundancy and merge ideas naturally.\n"
             "- Do not add information or explain.\n"
+            "- DO NOT output reasoning, thinking, or <think> blocks.\n"
             "- OUTPUT STRICTLY IN BRAZILIAN PORTUGUESE.\n"
             "- Output ONLY the rewritten subtitle. Do not output conversational filler or quotes."
         )
@@ -86,6 +90,7 @@ def condense_text(client, model, original_text, target_chars, temperature=0.1, m
             "- Remove adjectives, filler words, and repeated ideas first.\n"
             "- Prefer active voice and common vocabulary.\n"
             "- Keep the sentence easy to pronounce aloud.\n"
+            "- DO NOT output reasoning, thinking, or <think> blocks.\n"
             "- OUTPUT STRICTLY IN BRAZILIAN PORTUGUESE.\n"
             "- Output ONLY the condensed subtitle. Do not output conversational filler or quotes."
         )
@@ -114,9 +119,13 @@ def condense_text(client, model, original_text, target_chars, temperature=0.1, m
             model=model,
             messages=messages,
             temperature=temperature,
-            max_tokens=300,
+            max_tokens=2048,
         )
         condensed = response.choices[0].message.content.strip()
+        
+        # Strip reasoning blocks if the model ignores the instruction
+        condensed = re.sub(r'<think>.*?</think>', '', condensed, flags=re.DOTALL).strip()
+        
         # Clean up accidental quotes if the model added them
         if condensed.startswith('"') and condensed.endswith('"'):
             condensed = condensed[1:-1]
@@ -149,24 +158,20 @@ def main():
         # which LM Studio (and most unauthenticated endpoints) will safely ignore.
         client = OpenAI(base_url=args.endpoint, api_key=api_key if api_key else "dummy")
         
-        models_response = client.models.list()
-        loaded_models = [m.id for m in models_response.data]
-        
-        if args.model not in loaded_models:
-            logging.info(f"Model '{args.model}' not found in loaded models. Triggering dynamic load via warmup request...")
-            # Trigger JIT load into VRAM so it doesn't skew our condensation timing metrics
-            client.chat.completions.create(
-                model=args.model,
-                messages=[{"role": "user", "content": "warmup"}],
-                max_tokens=1,
-                extra_body={
-                    "context_length": args.context_length,
-                    "n_ctx": args.context_length
-                }
-            )
-            logging.info(f"Model '{args.model}' successfully loaded into VRAM.")
-        else:
-            logging.info(f"Model '{args.model}' is already loaded and ready.")
+        # Trigger JIT load into VRAM with explicit context window size.
+        # This ensures the model is loaded with the exact memory footprint requested
+        # before we start the condensation timing loop.
+        logging.info(f"Triggering JIT load for model '{args.model}' with context length {args.context_length}...")
+        client.chat.completions.create(
+            model=args.model,
+            messages=[{"role": "user", "content": "warmup"}],
+            max_tokens=1,
+            extra_body={
+                "context_length": args.context_length,
+                "n_ctx": args.context_length
+            }
+        )
+        logging.info(f"Model '{args.model}' successfully loaded into VRAM and ready.")
             
     except Exception as e:
         logging.error(f"Failed to connect to LLM at {args.endpoint}. Is LM Studio running? Error: {e}")
