@@ -1,4 +1,8 @@
 import logging
+
+logger = logging.getLogger("WhisperX")
+logger.propagate = False
+
 import os
 import sys
 import re
@@ -66,7 +70,7 @@ def apply_time_stretch_ffmpeg(waveform, sr, target_dur, ffmpeg_path):
     # FFmpeg's atempo accepts values between 0.5 and 100.0.
     tempo = min(tempo, 100.0)
     
-    logging.debug(f"[TimeStretch] Compressing {generated_dur:.2f}s to {target_dur:.2f}s (Speed {tempo:.2f}x)")
+    logger.debug(f"[TimeStretch] Compressing {generated_dur:.2f}s to {target_dur:.2f}s (Speed {tempo:.2f}x)")
     
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_in, \
          tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
@@ -165,7 +169,7 @@ def audio_extractor_worker(task_queue, segments, original_audio, ffmpeg_path):
                 'wav_path': wav_path,
                 'error': None
             })
-            logging.debug(f"[Producer] Extracted segment {idx+1} in {time.time() - t0:.3f}s (Queue size: {task_queue.qsize()})")
+            logger.debug(f"[Producer] Extracted segment {idx+1} in {time.time() - t0:.3f}s (Queue size: {task_queue.qsize()})")
         except Exception as e:
             # Pass the error down the queue so the main thread can handle/log it safely
             task_queue.put({
@@ -183,29 +187,22 @@ def main():
 
     # Configure logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=log_level, format="%(asctime)s - [%(levelname)s] - %(message)s")
-
-    # Fix Windows DLL loading for torchcodec (FFmpeg shared binaries)
-    if sys.platform == "win32":
-        ffmpeg_exe = shutil.which(args.ffmpeg_path)
-        if ffmpeg_exe:
-            ffmpeg_dir = os.path.dirname(ffmpeg_exe)
-            try:
-                os.add_dll_directory(ffmpeg_dir)
-                logging.debug(f"Automatically registered FFmpeg DLL directory: {ffmpeg_dir}")
-            except Exception as e:
-                logging.warning(f"Failed to register DLL directory {ffmpeg_dir}: {e}")
+    logger.setLevel(log_level)
+    if not logger.handlers:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(logging.Formatter("%(asctime)s - [%(levelname)s] - %(message)s"))
+        logger.addHandler(ch)
 
     # Verify input files
     for path in [args.original_audio, args.original_transcription, args.translated_transcription]:
         if not Path(path).is_file():
-            logging.error(f"File not found: {path}")
+            logger.error(f"File not found: {path}")
             sys.exit(1)
 
-    logging.info("Parsing transcriptions...")
+    logger.info("Parsing transcriptions...")
     segments = parse_transcriptions(args.original_transcription, args.translated_transcription)
     if not segments:
-        logging.error("No valid matching segments found in transcriptions.")
+        logger.error("No valid matching segments found in transcriptions.")
         sys.exit(1)
 
     start_idx = max(0, args.start_sentence - 1) if args.start_sentence is not None else 0
@@ -216,13 +213,13 @@ def main():
     segments = segments[start_idx:end_idx]
     
     if not segments:
-        logging.error(f"No segments left after trimming from {args.start_sentence} to {args.end_sentence}.")
+        logger.error(f"No segments left after trimming from {args.start_sentence} to {args.end_sentence}.")
         sys.exit(1)
         
-    logging.info(f"Loaded and sliced {len(segments)} segments for synthesis.")
+    logger.info(f"Loaded and sliced {len(segments)} segments for synthesis.")
 
     # Loading heavy modules after our argparse intro
-    logging.debug("Loading heavy modules (torch, torchaudio, nemo_text_processing, TTS)...")
+    logger.debug("Loading heavy modules (torch, torchaudio, nemo_text_processing, TTS)...")
     import torch
     import torchaudio
     from nemo_text_processing.text_normalization.normalize import Normalizer
@@ -235,25 +232,38 @@ def main():
     # Tell PyTorch to trust the XTTS config class (fixes deserialization security errors)
     torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, XttsArgs, BaseDatasetConfig])
 
+    # Fix Windows DLL loading for torchcodec (FFmpeg shared binaries) ONLY AFTER PyTorch is loaded
+    if sys.platform == "win32":
+        logger.debug("Checking and fixing Windows DLL loading for torchcodec...")
+        ffmpeg_exe = shutil.which(args.ffmpeg_path)
+        if ffmpeg_exe:
+            logger.debug(f"FFmpeg found at: {ffmpeg_exe}")
+            ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+            try:
+                os.add_dll_directory(ffmpeg_dir)
+                logger.debug(f"Successfully registered FFmpeg DLL directory: {ffmpeg_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to register DLL directory {ffmpeg_dir}: {e}")
+
     # TODO: Parametrize this model string later via argparser
     model_name = "tts_models/multilingual/multi-dataset/xtts_v2"
-    logging.info(f"Initializing Coqui XTTS-v2 AutoModel with: {model_name}")
+    logger.info(f"Initializing Coqui XTTS-v2 AutoModel with: {model_name}")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    logging.info(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
     
     try:
         tts = TTS(model_name=model_name, progress_bar=False).to(device)
         xtts = tts.synthesizer.tts_model
     except Exception as e:
-        logging.error(f"Failed to initialize XTTS-v2: {e}")
+        logger.error(f"Failed to initialize XTTS-v2: {e}")
         sys.exit(1)
 
-    logging.info("Initializing NeMo Text Normalizer for pt_BR...")
+    logger.info("Initializing NeMo Text Normalizer for pt_BR...")
     try:
         nemo_normalizer = Normalizer(input_case='cased', lang='pt')
     except Exception as e:
-        logging.error(f"Failed to initialize NeMo Normalizer: {e}")
+        logger.error(f"Failed to initialize NeMo Normalizer: {e}")
         sys.exit(1)
 
     target_sr = 24000  # Default XTTSv2 native sample rate
@@ -266,14 +276,14 @@ def main():
         args=(task_queue, segments, args.original_audio, args.ffmpeg_path),
         daemon=True
     )
-    logging.info("Starting background audio extraction thread...")
+    logger.info("Starting background audio extraction thread...")
     extractor_thread.start()
 
     final_audio_pieces = []
     # Initialize current_time to the start of the first sliced segment to prevent massive silence padding
     current_time = segments[0]['start'] if segments else 0.0
 
-    logging.info("Starting XTTS-v2 zero-shot TTS generation...")
+    logger.info("Starting XTTS-v2 zero-shot TTS generation...")
     global_start_time = time.time()
     segment_processing_times = []
 
@@ -297,33 +307,33 @@ def main():
         trans_text = seg['trans_text']
         
         # Normalize text to Portuguese before processing
-        logging.debug(f"Calling NeMo to normalize target text: {trans_text}")
+        logger.debug(f"Calling NeMo to normalize target text: {trans_text}")
         try:
             trans_text = nemo_normalizer.normalize(trans_text, verbose=False)
         except Exception as e:
-            logging.warning(f"NeMo normalization failed for '{trans_text}'. Using original text. Error: {e}")
+            logger.warning(f"NeMo normalization failed for '{trans_text}'. Using original text. Error: {e}")
         
-        logging.info(f"[{global_offset + idx + 1}/{global_offset + len(segments)} (Trimmed)] Synthesizing clip: [{start:.2f}s - {end:.2f}s]")
-        logging.debug(f"[Consumer] Waited {wait_time:.3f}s for Producer queue")
-        logging.debug(f"  Reference Text: {orig_text}")
-        logging.debug(f"  Normalized Text:    {trans_text}")
+        logger.info(f"[{global_offset + idx + 1}/{global_offset + len(segments)} (Trimmed)] Synthesizing clip: [{start:.2f}s - {end:.2f}s]")
+        logger.debug(f"[Consumer] Waited {wait_time:.3f}s for Producer queue")
+        logger.debug(f"  Reference Text: {orig_text}")
+        logger.debug(f"  Normalized Text:    {trans_text}")
 
         if extract_error:
-            logging.error(f"  Failed to extract reference audio: {extract_error}")
-            logging.warning("  Skipping this segment to continue pipeline.")
+            logger.error(f"  Failed to extract reference audio: {extract_error}")
+            logger.warning("  Skipping this segment to continue pipeline.")
             continue
 
         # 1. Padding with Silence to emulate absolute timestamps
         if start > current_time:
             silence_dur = start - current_time
-            logging.debug(f"  Padding with {silence_dur:.2f}s of silence to align timeline.")
+            logger.debug(f"  Padding with {silence_dur:.2f}s of silence to align timeline.")
             silence_samples = int(silence_dur * target_sr)
             final_audio_pieces.append(torch.zeros(1, silence_samples))
             current_time = start
 
         # 2. Generate Audio
         try:
-            logging.debug(f"[Consumer] Computing voice latents from reference audio...")
+            logger.debug(f"[Consumer] Computing voice latents from reference audio...")
             infer_t0 = time.time()
             
             # Compute latents from prompt audio
@@ -332,7 +342,7 @@ def main():
                 gpt_cond_len=30, # Max conditioning length is 30s
             )
             
-            logging.debug(f"[Consumer] Calling xtts.inference...")
+            logger.debug(f"[Consumer] Calling xtts.inference...")
             out = xtts.inference(
                 text=trans_text,
                 language="pt",
@@ -342,12 +352,12 @@ def main():
             )
 
             infer_time = time.time() - infer_t0
-            logging.debug(f"[Consumer] Finished inference in {infer_time:.3f}s")
+            logger.debug(f"[Consumer] Finished inference in {infer_time:.3f}s")
             
             cpu_t0 = time.time()
             # Convert NumPy array to PyTorch tensor and add channel dimension
             tts_speech = torch.from_numpy(out["wav"]).unsqueeze(0)
-            logging.debug(f"[Consumer] Converted numpy output to CPU tensor in {time.time() - cpu_t0:.3f}s")
+            logger.debug(f"[Consumer] Converted numpy output to CPU tensor in {time.time() - cpu_t0:.3f}s")
             
             # --- START TIMELINE MODEL ---
             generated_dur = tts_speech.shape[1] / target_sr
@@ -358,16 +368,16 @@ def main():
                     # 3a. Stretch audio if it exceeds strict window
                     stretched_speech = apply_time_stretch_ffmpeg(tts_speech, target_sr, target_dur, args.ffmpeg_path)
                     final_audio_pieces.append(stretched_speech)
-                    logging.debug(f"  Time-stretched audio from {generated_dur:.2f}s down to {target_dur:.2f}s.")
+                    logger.debug(f"  Time-stretched audio from {generated_dur:.2f}s down to {target_dur:.2f}s.")
                     
                     generated_dur = stretched_speech.shape[1] / target_sr
                     current_time = end
-                    logging.debug(f"  Timeline strictly advanced to {current_time:.2f}s.")
+                    logger.debug(f"  Timeline strictly advanced to {current_time:.2f}s.")
                 else:
                     # 3b. Accept timeline drift (Condensation disabled)
                     final_audio_pieces.append(tts_speech)
                     current_time += generated_dur
-                    logging.debug(f"  Timeline drifted to {current_time:.2f}s (overshot by {generated_dur - target_dur:.2f}s).")
+                    logger.debug(f"  Timeline drifted to {current_time:.2f}s (overshot by {generated_dur - target_dur:.2f}s).")
             else:
                 # 3c. Pad with silence if it's shorter than strict window
                 final_audio_pieces.append(tts_speech)
@@ -375,32 +385,32 @@ def main():
                 silence_samples = int(shortfall * target_sr)
                 if silence_samples > 0:
                     final_audio_pieces.append(torch.zeros(1, silence_samples))
-                logging.debug(f"  Padded tail with {shortfall:.2f}s of silence.")
+                logger.debug(f"  Padded tail with {shortfall:.2f}s of silence.")
                 current_time = end
-                logging.debug(f"  Timeline strictly advanced to {current_time:.2f}s.")
+                logger.debug(f"  Timeline strictly advanced to {current_time:.2f}s.")
             # --- END TIMELINE MODEL ---
 
             segment_processing_times.append(time.time() - segment_t0)
 
         except Exception as e:
-            logging.error(f"  TTS generation failed for segment {idx+1}: {e}")
-            logging.warning("  Skipping this segment to continue pipeline.")
+            logger.error(f"  TTS generation failed for segment {idx+1}: {e}")
+            logger.warning("  Skipping this segment to continue pipeline.")
             continue
         finally:
             if reference_audio_path and os.path.exists(reference_audio_path):
                 os.remove(reference_audio_path)
 
     # Assemble and save
-    logging.info("Concatenating all segments and silence buffers...")
+    logger.info("Concatenating all segments and silence buffers...")
     if final_audio_pieces:
         final_waveform = torch.cat(final_audio_pieces, dim=1)
         torchaudio.save(args.output_file, final_waveform, target_sr)
-        logging.info("==================================================")
-        logging.info(f"Synthesized Output Saved: {args.output_file}")
-        logging.info(f"Final Track Duration: {final_waveform.shape[1] / target_sr:.2f} seconds")
-        logging.info("==================================================")
+        logger.info("==================================================")
+        logger.info(f"Synthesized Output Saved: {args.output_file}")
+        logger.info(f"Final Track Duration: {final_waveform.shape[1] / target_sr:.2f} seconds")
+        logger.info("==================================================")
     else:
-        logging.error("No audio was generated!")
+        logger.error("No audio was generated!")
         
     total_time = time.time() - global_start_time
     
@@ -410,16 +420,16 @@ def main():
         min_time = min(segment_processing_times)
         max_time = max(segment_processing_times)
         
-        logging.info("=" * 50)
-        logging.info("SYNTHESIS PERFORMANCE STATISTICS")
-        logging.info("=" * 50)
-        logging.info(f"Total Pipeline Time:       {total_time:.2f}s")
-        logging.info(f"Total Segments Processed:  {len(segment_processing_times)}")
-        logging.info(f"Mean Time per Segment:     {mean_time:.2f}s")
-        logging.info(f"Median Time per Segment:   {median_time:.2f}s")
-        logging.info(f"Fastest Segment:           {min_time:.2f}s")
-        logging.info(f"Slowest Segment:           {max_time:.2f}s")
-        logging.info("=" * 50)
+        logger.info("=" * 50)
+        logger.info("SYNTHESIS PERFORMANCE STATISTICS")
+        logger.info("=" * 50)
+        logger.info(f"Total Pipeline Time:       {total_time:.2f}s")
+        logger.info(f"Total Segments Processed:  {len(segment_processing_times)}")
+        logger.info(f"Mean Time per Segment:     {mean_time:.2f}s")
+        logger.info(f"Median Time per Segment:   {median_time:.2f}s")
+        logger.info(f"Fastest Segment:           {min_time:.2f}s")
+        logger.info(f"Slowest Segment:           {max_time:.2f}s")
+        logger.info("=" * 50)
 
 if __name__ == "__main__":
     main()
