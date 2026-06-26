@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.1, help="LLM Temperature (creativity). Lower is more strict, higher is more creative. (default: 0.1)")
     parser.add_argument("--maintain-context", action="store_true", help="Tell the LLM via system prompt to creatively paraphrase while maintaining original context instead of strictly cutting.")
     parser.add_argument("--chat-mode", action="store_true", help="Maintain a continuous chat history with the LLM across the entire script for full context. Warning: Uses more VRAM and slows down over time.")
+    parser.add_argument("--auto-abstract", type=int, default=0, help="Number of lines to read at the start to generate a 2-sentence global context abstract. Use -1 for the entire file. Default is 0 (disabled).")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose debug logging")
     return parser.parse_args()
 
@@ -32,26 +33,69 @@ def parse_time(time_str):
     else:
         return float(time_str.replace('s', ''))
 
-def condense_text(client, model, original_text, target_chars, temperature=0.1, maintain_context=False, chat_history=None):
+def generate_abstract(client, model, abstract_text, temperature=0.1):
+    system_prompt = "You are an expert summarizer. Read the following video subtitle script and write a 2-sentence summary of the video's core topic and context. Do not include introductory phrases. Output strictly the summary."
+    user_prompt = f"SCRIPT EXTRACT:\n{abstract_text}"
+    
+    try:
+        logging.debug("Sending abstract generation request to LLM...")
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=temperature,
+            max_tokens=150,
+        )
+        abstract = response.choices[0].message.content.strip()
+        logging.info(f"Generated Global Abstract: {abstract}")
+        return abstract
+    except Exception as e:
+        logging.error(f"Failed to generate abstract: {e}")
+        return None
+
+def condense_text(client, model, original_text, target_chars, temperature=0.1, maintain_context=False, chat_history=None, abstract=None):
+    abstract_injection = f"\nGLOBAL VIDEO CONTEXT: {abstract}\n" if abstract else ""
+    
     if maintain_context:
         system_prompt = (
-            "You are an expert dubbing scriptwriter. Your job is to rewrite and paraphrase Portuguese subtitles "
-            "to fit the allotted time constraint. You must strictly obey the character limit provided. "
-            "However, it is critical that you MAINTAIN THE ORIGINAL CONTEXT AND TONE of the phrase. "
-            "You may creatively restructure the sentence to achieve this. "
-            "OUTPUT ONLY THE REWRITTEN TEXT. Do not output conversational filler, introductions, quotes, or explanations. "
-            "CRITICAL RULE: You must output STRICTLY in Portuguese. Do not output any Chinese characters, pinyin, or translation notes."
+            "You are a professional Brazilian Portuguese dubbing adapter.\n"
+            f"{abstract_injection}"
+            "Your task is to rewrite a Portuguese subtitle so it sounds natural in spoken Brazilian Portuguese and fits strictly within the allotted time constraint.\n\n"
+            "Priorities (highest to lowest):\n"
+            "1. Preserve the original meaning.\n"
+            "2. Preserve the original tone.\n"
+            "3. Make it sound like native speech.\n"
+            "4. Stay within the maximum length.\n\n"
+            "Rules:\n"
+            "- If necessary, sacrifice detail instead of meaning.\n"
+            "- Prefer shorter and more common words.\n"
+            "- Remove redundancy and merge ideas naturally.\n"
+            "- Do not add information or explain.\n"
+            "- OUTPUT STRICTLY IN BRAZILIAN PORTUGUESE.\n"
+            "- Output ONLY the rewritten subtitle. Do not output conversational filler or quotes."
         )
     else:
         system_prompt = (
-            "You are an expert dubbing scriptwriter. Your job is to rewrite Portuguese subtitles "
-            "to be shorter, punchier, and faster to speak, without losing the core meaning. "
-            "You must strictly obey the character limit provided. OUTPUT ONLY THE CONDENSED TEXT. "
-            "Do not output conversational filler, introductions, quotes, or explanations. "
-            "CRITICAL RULE: You must output STRICTLY in Portuguese. Do not output any Chinese characters, pinyin, or translation notes."
+            "You are a professional subtitle condenser for Brazilian Portuguese dubbing focused on extreme synthesis and speech speed.\n"
+            f"{abstract_injection}"
+            "Your task is to drastically reduce the Portuguese subtitle to make it as short and direct as possible without losing the core meaning.\n\n"
+            "Rules:\n"
+            "- Every word must justify its existence.\n"
+            "- Remove adjectives, filler words, and repeated ideas first.\n"
+            "- Prefer active voice and common vocabulary.\n"
+            "- Keep the sentence easy to pronounce aloud.\n"
+            "- OUTPUT STRICTLY IN BRAZILIAN PORTUGUESE.\n"
+            "- Output ONLY the condensed subtitle. Do not output conversational filler or quotes."
         )
         
-    user_prompt = f"Rewrite the following text to be strictly under {int(target_chars)} characters:\n\n{original_text}"
+    user_prompt = (
+        "ORIGINAL TEXT:\n"
+        f"{original_text}\n\n"
+        f"ABSOLUTE MAXIMUM LIMIT: {int(target_chars)} characters.\n\n"
+        "Rewrite the text strictly respecting the limit."
+    )
     
     if chat_history is not None:
         if not chat_history:
@@ -139,6 +183,26 @@ def main():
     # Group 4: The text to be translated
     pattern = re.compile(r'^(\[([\d:.]+)s?\s*(?:-->|-)\s*([\d:.]+)s?\](?:.*?:\s*)?)(.*)$')
     
+    global_abstract = None
+    if args.auto_abstract != 0:
+        logging.info("Extracting text for global abstract generation...")
+        abstract_lines = []
+        with open(args.translated_transcription, 'r', encoding='utf-8') as f:
+            for i, line in enumerate(f):
+                if args.auto_abstract > 0 and i >= args.auto_abstract:
+                    break
+                match = pattern.match(line)
+                if match:
+                    abstract_lines.append(match.group(4).strip())
+                elif line.strip():
+                    abstract_lines.append(line.strip())
+        
+        if abstract_lines:
+            abstract_text = "\n".join(abstract_lines)
+            global_abstract = generate_abstract(client, args.model, abstract_text, args.temperature)
+        else:
+            logging.warning("Failed to extract any text for abstract generation.")
+    
     lines_processed = 0
     condensed_count = 0
     total_chars_saved = 0
@@ -172,7 +236,7 @@ def main():
                 logging.debug(f"[{buffered_start_str} - {buffered_end_str}] Too long ({len(text)} > {int(target_char_limit)}). Condensing...")
                 
                 llm_t0 = time.time()
-                condensed = condense_text(client, args.model, text, target_char_limit, args.temperature, args.maintain_context, conversation_history)
+                condensed = condense_text(client, args.model, text, target_char_limit, args.temperature, args.maintain_context, conversation_history, global_abstract)
                 llm_call_times.append(time.time() - llm_t0)
                 
                 if args.cooldown > 0:
