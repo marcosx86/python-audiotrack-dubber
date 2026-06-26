@@ -89,6 +89,7 @@ Condenses translated transcription lines using a local LLM via an OpenAI-compati
 **Key Features:**
 - **Local AI Pipeline**: Connects safely to local LLMs (LM Studio, llama.cpp) via the standard OpenAI API structure.
 - **Dynamic Character Limiting**: Automatically calculates a strict target character limit per segment based on its specific duration in the timeline.
+- **Context Preservation**: Includes a `--maintain-context` flag to allow the LLM to creatively paraphrase sentences rather than strictly truncating them, preserving the original tone.
 - **Hardware Protection**: Provides a `--cooldown` parameter to enforce delays between API calls and a `--context-length` parameter injected via `extra_body` during the JIT load warmup to prevent GPU overheating, BSODs, and VRAM OOMs during rapid, sequential inferences.
 - **Smart Preservation**: Safely skips short sentences, gracefully buffers multiline transcriptions, flawlessly preserves the strict WhisperX prefix formatting, and protects against token hallucination via system prompt enforcement.
 

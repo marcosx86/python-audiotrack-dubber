@@ -20,6 +20,7 @@ def parse_args():
     parser.add_argument("--context-length", type=int, default=2048, help="Context window size to request during JIT load. Drastically reduces VRAM. (default: 2048)")
     parser.add_argument("--cooldown", type=float, default=1.5, help="Artificial delay (in seconds) between LLM calls to prevent GPU overheating/BSODs (default: 1.5)")
     parser.add_argument("--temperature", type=float, default=0.1, help="LLM Temperature (creativity). Lower is more strict, higher is more creative. (default: 0.1)")
+    parser.add_argument("--maintain-context", action="store_true", help="Tell the LLM via system prompt to creatively paraphrase while maintaining original context instead of strictly cutting.")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose debug logging")
     return parser.parse_args()
 
@@ -30,15 +31,26 @@ def parse_time(time_str):
     else:
         return float(time_str.replace('s', ''))
 
-def condense_text(client, model, original_text, target_chars, temperature=0.1):
-    system_prompt = (
-        "You are an expert dubbing scriptwriter. Your job is to rewrite Portuguese subtitles "
-        "to be shorter, punchier, and faster to speak, without losing the core meaning. "
-        "You must strictly obey the character limit provided. OUTPUT ONLY THE CONDENSED TEXT. "
-        "Do not output conversational filler, introductions, quotes, or explanations. "
-        "CRITICAL RULE: You must output STRICTLY in Portuguese. Do not output any Chinese characters, pinyin, or translation notes."
-    )
-    user_prompt = f"Condense the following text to be strictly under {int(target_chars)} characters:\n\n{original_text}"
+def condense_text(client, model, original_text, target_chars, temperature=0.1, maintain_context=False):
+    if maintain_context:
+        system_prompt = (
+            "You are an expert dubbing scriptwriter. Your job is to rewrite and paraphrase Portuguese subtitles "
+            "to fit the allotted time constraint. You must strictly obey the character limit provided. "
+            "However, it is critical that you MAINTAIN THE ORIGINAL CONTEXT AND TONE of the phrase. "
+            "You may creatively restructure the sentence to achieve this. "
+            "OUTPUT ONLY THE REWRITTEN TEXT. Do not output conversational filler, introductions, quotes, or explanations. "
+            "CRITICAL RULE: You must output STRICTLY in Portuguese. Do not output any Chinese characters, pinyin, or translation notes."
+        )
+    else:
+        system_prompt = (
+            "You are an expert dubbing scriptwriter. Your job is to rewrite Portuguese subtitles "
+            "to be shorter, punchier, and faster to speak, without losing the core meaning. "
+            "You must strictly obey the character limit provided. OUTPUT ONLY THE CONDENSED TEXT. "
+            "Do not output conversational filler, introductions, quotes, or explanations. "
+            "CRITICAL RULE: You must output STRICTLY in Portuguese. Do not output any Chinese characters, pinyin, or translation notes."
+        )
+        
+    user_prompt = f"Rewrite the following text to be strictly under {int(target_chars)} characters:\n\n{original_text}"
     
     try:
         logging.debug(f"Sending request to LLM...")
@@ -141,7 +153,7 @@ def main():
                 logging.debug(f"[{buffered_start_str} - {buffered_end_str}] Too long ({len(text)} > {int(target_char_limit)}). Condensing...")
                 
                 llm_t0 = time.time()
-                condensed = condense_text(client, args.model, text, target_char_limit, args.temperature)
+                condensed = condense_text(client, args.model, text, target_char_limit, args.temperature, args.maintain_context)
                 llm_call_times.append(time.time() - llm_t0)
                 
                 if args.cooldown > 0:
