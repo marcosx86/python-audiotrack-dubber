@@ -21,6 +21,7 @@ def parse_args():
     parser.add_argument("--cooldown", type=float, default=1.5, help="Artificial delay (in seconds) between LLM calls to prevent GPU overheating/BSODs (default: 1.5)")
     parser.add_argument("--temperature", type=float, default=0.1, help="LLM Temperature (creativity). Lower is more strict, higher is more creative. (default: 0.1)")
     parser.add_argument("--maintain-context", action="store_true", help="Tell the LLM via system prompt to creatively paraphrase while maintaining original context instead of strictly cutting.")
+    parser.add_argument("--chat-mode", action="store_true", help="Maintain a continuous chat history with the LLM across the entire script for full context. Warning: Uses more VRAM and slows down over time.")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose debug logging")
     return parser.parse_args()
 
@@ -31,7 +32,7 @@ def parse_time(time_str):
     else:
         return float(time_str.replace('s', ''))
 
-def condense_text(client, model, original_text, target_chars, temperature=0.1, maintain_context=False):
+def condense_text(client, model, original_text, target_chars, temperature=0.1, maintain_context=False, chat_history=None):
     if maintain_context:
         system_prompt = (
             "You are an expert dubbing scriptwriter. Your job is to rewrite and paraphrase Portuguese subtitles "
@@ -52,14 +53,22 @@ def condense_text(client, model, original_text, target_chars, temperature=0.1, m
         
     user_prompt = f"Rewrite the following text to be strictly under {int(target_chars)} characters:\n\n{original_text}"
     
+    if chat_history is not None:
+        if not chat_history:
+            chat_history.append({"role": "system", "content": system_prompt})
+        chat_history.append({"role": "user", "content": user_prompt})
+        messages = chat_history
+    else:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
     try:
         logging.debug(f"Sending request to LLM...")
         response = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
+            messages=messages,
             temperature=temperature,
             max_tokens=300,
         )
@@ -67,10 +76,17 @@ def condense_text(client, model, original_text, target_chars, temperature=0.1, m
         # Clean up accidental quotes if the model added them
         if condensed.startswith('"') and condensed.endswith('"'):
             condensed = condensed[1:-1]
+            
+        if chat_history is not None:
+            chat_history.append({"role": "assistant", "content": condensed})
+            
         logging.debug(f"Condensed text from LLM: {condensed}")
         return condensed
     except Exception as e:
         logging.error(f"Failed to condense text: {e}")
+        # On failure in chat mode, remove the user message so it doesn't pollute context
+        if chat_history is not None and len(chat_history) > 0 and chat_history[-1]["role"] == "user":
+            chat_history.pop()
         return original_text
 
 def main():
@@ -141,6 +157,9 @@ def main():
         buffered_text = ""
         buffered_duration = 0
         
+        # Initialize conversation history if chat mode is enabled
+        conversation_history = [] if args.chat_mode else None
+        
         def flush_buffer():
             nonlocal lines_processed, condensed_count, total_chars_saved
             if buffered_prefix is None:
@@ -153,7 +172,7 @@ def main():
                 logging.debug(f"[{buffered_start_str} - {buffered_end_str}] Too long ({len(text)} > {int(target_char_limit)}). Condensing...")
                 
                 llm_t0 = time.time()
-                condensed = condense_text(client, args.model, text, target_char_limit, args.temperature, args.maintain_context)
+                condensed = condense_text(client, args.model, text, target_char_limit, args.temperature, args.maintain_context, conversation_history)
                 llm_call_times.append(time.time() - llm_t0)
                 
                 if args.cooldown > 0:
