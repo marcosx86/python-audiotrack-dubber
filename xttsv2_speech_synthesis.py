@@ -64,6 +64,8 @@ def apply_time_stretch_ffmpeg(waveform, sr, target_dur, ffmpeg_path):
     If the waveform is longer than target_dur, stretches it using FFmpeg's atempo filter.
     Returns the stretched tensor.
     """
+    import torchaudio
+
     generated_dur = waveform.shape[1] / sr
     if generated_dur <= target_dur * 1.02: # Allow tiny 2% margin to avoid unnecessary I/O
         return waveform
@@ -225,17 +227,21 @@ def main():
     logger.info(f"Loaded and sliced {len(segments)} segments for synthesis.")
 
     # Loading heavy modules after our argparse intro
-    logger.debug("Loading heavy modules (torch, torchaudio, nemo_text_processing, TTS)...")
+    logger.debug("Loading torch module...")
     import torch
+    logger.debug("Loading torchaudio module...")
     import torchaudio
+    logger.debug("Loading NVIDIA NeMo's text processing module...")
     from nemo_text_processing.text_normalization.normalize import Normalizer
-
+    logger.debug("Loading Coqui TTS module...")
     from TTS.api import TTS
+    logger.debug("Loading XTTS config modules...")
     from TTS.tts.configs.xtts_config import XttsConfig
     from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
     from TTS.config.shared_configs import BaseDatasetConfig
 
     # Tell PyTorch to trust the XTTS config class (fixes deserialization security errors)
+    logger.debug("Enabling XTTS config trust on torch library...")
     torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, XttsArgs, BaseDatasetConfig])
 
     # Fix Windows DLL loading for torchcodec (FFmpeg shared binaries) ONLY AFTER PyTorch is loaded
