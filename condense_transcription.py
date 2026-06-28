@@ -23,6 +23,7 @@ def parse_args():
     parser.add_argument("--maintain-context", action="store_true", help="Tell the LLM via system prompt to creatively paraphrase while maintaining original context instead of strictly cutting.")
     parser.add_argument("--chat-mode", action="store_true", help="Maintain a continuous chat history with the LLM across the entire script for full context. Warning: Uses more VRAM and slows down over time.")
     parser.add_argument("--auto-abstract", type=int, default=0, help="Number of lines to read at the start to generate a 2-sentence global context abstract. Use -1 for the entire file. Default is 0 (disabled).")
+    parser.add_argument("--break-sentences", action="store_true", help="Detect multi-phrase sentences and break them into smaller proportional time windows based on character count before condensing.")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose debug logging")
     return parser.parse_args()
 
@@ -32,6 +33,57 @@ def parse_time(time_str):
         return int(h) * 3600 + int(m) * 60 + float(s)
     else:
         return float(time_str.replace('s', ''))
+
+def format_time(seconds, original_format_str):
+    if ':' in original_format_str:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = seconds % 60
+        return f"{h:02d}:{m:02d}:{s:06.3f}"
+    else:
+        return f"{seconds:06.2f}s"
+
+def split_into_phrases(text):
+    import re
+    # Common abbreviations that shouldn't trigger a sentence break
+    abbrevs = {"sr", "sra", "dr", "dra", "prof", "profa", "eng", "av", "rod", "inc", "ltd", "cia", "ex", "exmo", "exma", "ilmo", "ilma", "etc", "vs", "v", "pag", "p", "vol", "ed"}
+    
+    parts = re.split(r'([.!?…]+(?:\s+|$))', text.strip())
+    
+    phrases = []
+    current = ""
+    
+    for i in range(0, len(parts), 2):
+        chunk = parts[i]
+        punct = parts[i+1] if i+1 < len(parts) else ""
+        current += chunk + punct
+        
+        if not punct:
+            continue
+            
+        last_word_match = re.search(r'([a-zA-ZáéíóúâêôãõçÁÉÍÓÚÂÊÔÃÕÇ]+)$', chunk)
+        is_abbrev = False
+        if last_word_match and punct.strip() == '.':
+            if last_word_match.group(1).lower() in abbrevs:
+                is_abbrev = True
+                
+        next_chunk = parts[i+2] if i+2 < len(parts) else ""
+        next_starts_lower = False
+        if next_chunk:
+            first_char = next_chunk.lstrip()[0] if next_chunk.lstrip() else ""
+            if first_char.islower():
+                next_starts_lower = True
+                
+        if is_abbrev or next_starts_lower:
+            continue
+            
+        phrases.append(current.strip())
+        current = ""
+        
+    if current.strip():
+        phrases.append(current.strip())
+        
+    return phrases
 
 def generate_abstract(client, model, abstract_text, temperature=0.1):
     system_prompt = "You are an expert summarizer. Read the following video subtitle script and write a 2-sentence summary of the video's core topic and context. Do not include introductory phrases. Output strictly the summary."
@@ -235,34 +287,59 @@ def main():
                 return
                 
             text = buffered_text.strip()
-            target_char_limit = buffered_duration * args.max_chars_per_sec
             
-            if buffered_duration > 0 and len(text) > target_char_limit:
-                logging.debug(f"[{buffered_start_str} - {buffered_end_str}] Too long ({len(text)} > {int(target_char_limit)}). Condensing...")
-                
-                llm_t0 = time.time()
-                condensed = condense_text(client, args.model, text, target_char_limit, args.temperature, args.maintain_context, conversation_history, global_abstract)
-                llm_call_times.append(time.time() - llm_t0)
-                
-                if args.cooldown > 0:
-                    logging.debug(f"  Cooling down for {args.cooldown}s to protect hardware...")
-                    time.sleep(args.cooldown)
-                
-                if len(condensed) < len(text):
-                    total_chars_saved += (len(text) - len(condensed))
-                    condensed_count += 1
-                    logging.info(f"  Original : {text}")
-                    logging.info(f"  Condensed: {condensed} ({len(condensed)} chars)")
-                    
-                    # Convert any inner newlines from the model to spaces for a clean single-line output
-                    condensed_single_line = condensed.replace('\n', ' ')
-                    outfile.write(f"{buffered_prefix}{condensed_single_line}\n")
+            phrases = split_into_phrases(text) if args.break_sentences else [text]
+            total_chars = sum(len(p) for p in phrases) if args.break_sentences and len(phrases) > 1 else len(text)
+            if len(phrases) > 1:
+                logging.info(f"[{buffered_start_str} - {buffered_end_str}] Broken into {len(phrases)} phrases: {phrases}")
+            
+            # Extract speaker part from prefix to rebuild correctly
+            prefix_match = re.match(r'^\[.*?\](.*)', buffered_prefix)
+            speaker_part = prefix_match.group(1) if prefix_match else " "
+            
+            current_start_sec = parse_time(buffered_start_str)
+            
+            for phrase in phrases:
+                if args.break_sentences and len(phrases) > 1:
+                    phrase_dur = (len(phrase) / total_chars) * buffered_duration
+                    current_end_sec = current_start_sec + phrase_dur
+                    start_str = format_time(current_start_sec, buffered_start_str)
+                    end_str = format_time(current_end_sec, buffered_end_str)
+                    phrase_prefix = f"[{start_str} - {end_str}]{speaker_part}"
+                    current_start_sec = current_end_sec
                 else:
-                    logging.warning("  LLM failed to shorten text (new size is bigger than original sentence). Keeping original.")
-                    outfile.write(f"{buffered_prefix}{text}\n")
-            else:
-                outfile.write(f"{buffered_prefix}{text}\n")
+                    phrase_dur = buffered_duration
+                    phrase_prefix = buffered_prefix
+                    start_str = buffered_start_str
+                    end_str = buffered_end_str
+                    
+                target_char_limit = phrase_dur * args.max_chars_per_sec
                 
+                if phrase_dur > 0 and len(phrase) > target_char_limit:
+                    logging.debug(f"[{start_str} - {end_str}] Too long ({len(phrase)} > {int(target_char_limit)}). Condensing...")
+                    
+                    llm_t0 = time.time()
+                    condensed = condense_text(client, args.model, phrase, target_char_limit, args.temperature, args.maintain_context, conversation_history, global_abstract)
+                    llm_call_times.append(time.time() - llm_t0)
+                    
+                    if args.cooldown > 0:
+                        logging.debug(f"  Cooling down for {args.cooldown}s to protect hardware...")
+                        time.sleep(args.cooldown)
+                    
+                    if len(condensed) < len(phrase):
+                        total_chars_saved += (len(phrase) - len(condensed))
+                        condensed_count += 1
+                        logging.info(f"  Original : {phrase}")
+                        logging.info(f"  Condensed: {condensed} ({len(condensed)} chars)")
+                        
+                        condensed_single_line = condensed.replace('\n', ' ')
+                        outfile.write(f"{phrase_prefix}{condensed_single_line}\n")
+                    else:
+                        logging.warning("  LLM failed to shorten text (new size is bigger than original sentence). Keeping original.")
+                        outfile.write(f"{phrase_prefix}{phrase}\n")
+                else:
+                    outfile.write(f"{phrase_prefix}{phrase}\n")
+                    
             lines_processed += 1
 
         for line in infile:
