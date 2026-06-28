@@ -190,7 +190,7 @@ def audio_extractor_worker(task_queue, segments, original_audio, ffmpeg_path, sk
     # Send a poison pill to indicate completion
     task_queue.put(None)
 
-def run_inference_worker(task, xtts, nemo_normalizer, global_gpt_cond_latent, global_speaker_embedding, cooldown):
+def run_inference_worker(task, xtts, global_gpt_cond_latent, global_speaker_embedding, cooldown):
     import time
     import torch
     import os
@@ -199,15 +199,11 @@ def run_inference_worker(task, xtts, nemo_normalizer, global_gpt_cond_latent, gl
     reference_audio_path = task['wav_path']
     extract_error = task['error']
     trans_text = seg['trans_text']
+    nemo_time = task.get('nemo_time', 0.0)
     
     if extract_error and global_gpt_cond_latent is None:
-        return {'idx': idx, 'task': task, 'tensor': None, 'error': f"Failed to extract reference audio: {extract_error}"}
+        return {'idx': idx, 'task': task, 'tensor': None, 'error': f"Failed to extract reference audio: {extract_error}", 'infer_time': 0, 'nemo_time': nemo_time}
 
-    try:
-        trans_text = nemo_normalizer.normalize(trans_text, verbose=False)
-    except Exception as e:
-        pass # use original text
-        
     try:
         if global_gpt_cond_latent is not None:
             gpt_cond_latent = global_gpt_cond_latent
@@ -218,6 +214,7 @@ def run_inference_worker(task, xtts, nemo_normalizer, global_gpt_cond_latent, gl
                 gpt_cond_len=30,
             )
             
+        infer_t0 = time.time()
         out = xtts.inference(
             text=trans_text,
             language="pt",
@@ -225,14 +222,15 @@ def run_inference_worker(task, xtts, nemo_normalizer, global_gpt_cond_latent, gl
             speaker_embedding=speaker_embedding,
             speed=1.0
         )
+        infer_time = time.time() - infer_t0
         
         if cooldown > 0:
             time.sleep(cooldown)
             
         tts_speech = torch.from_numpy(out["wav"]).unsqueeze(0)
-        return {'idx': idx, 'task': task, 'tensor': tts_speech, 'error': None}
+        return {'idx': idx, 'task': task, 'tensor': tts_speech, 'error': None, 'infer_time': infer_time, 'nemo_time': nemo_time}
     except Exception as e:
-        return {'idx': idx, 'task': task, 'tensor': None, 'error': str(e)}
+        return {'idx': idx, 'task': task, 'tensor': None, 'error': str(e), 'infer_time': 0, 'nemo_time': nemo_time}
     finally:
         if reference_audio_path and os.path.exists(reference_audio_path):
             os.remove(reference_audio_path)
@@ -372,13 +370,23 @@ def main():
         task = task_queue.get()
         
         if task is not None:
+            nemo_t0 = time.time()
+            try:
+                task['seg']['trans_text'] = nemo_normalizer.normalize(task['seg']['trans_text'], verbose=False)
+            except Exception as e:
+                pass # Use original
+            task['nemo_time'] = time.time() - nemo_t0
+            
+            # Since global latents could be modified in-place by XTTS, we clone them if they exist
+            g_latent = global_gpt_cond_latent.clone() if global_gpt_cond_latent is not None else None
+            g_speaker = global_speaker_embedding.clone() if global_speaker_embedding is not None else None
+            
             future = executor.submit(
                 run_inference_worker, 
                 task, 
                 xtts, 
-                nemo_normalizer, 
-                global_gpt_cond_latent, 
-                global_speaker_embedding,
+                g_latent, 
+                g_speaker,
                 args.cooldown
             )
             pending_futures[task['idx']] = future
@@ -392,6 +400,8 @@ def main():
                 seg = future_result['task']['seg']
                 tts_speech = future_result['tensor']
                 error = future_result['error']
+                infer_time = future_result.get('infer_time', 0)
+                nemo_time = future_result.get('nemo_time', 0)
                 
                 start = seg['start']
                 end = seg['end']
@@ -407,7 +417,6 @@ def main():
                 # 1. Padding with Silence to emulate absolute timestamps
                 if start > current_time:
                     silence_dur = start - current_time
-                    logger.debug(f"  Padding with {silence_dur:.2f}s of silence to align timeline.")
                     silence_samples = int(silence_dur * target_sr)
                     final_audio_pieces.append(torch.zeros(1, silence_samples))
                     current_time = start
@@ -416,11 +425,13 @@ def main():
                 generated_dur = tts_speech.shape[1] / target_sr
                 target_dur = end - start
                 
+                ffmpeg_time = 0.0
                 if generated_dur > target_dur:
                     if args.time_stretch:
+                        ffmpeg_t0 = time.time()
                         stretched_speech = apply_time_stretch_ffmpeg(tts_speech, target_sr, target_dur, args.ffmpeg_path)
+                        ffmpeg_time = time.time() - ffmpeg_t0
                         final_audio_pieces.append(stretched_speech)
-                        logger.debug(f"  Time-stretched audio from {generated_dur:.2f}s down to {target_dur:.2f}s.")
                         current_time = end
                     else:
                         final_audio_pieces.append(tts_speech)
@@ -432,13 +443,14 @@ def main():
                     silence_samples = int(shortfall * target_sr)
                     if silence_samples > 0:
                         final_audio_pieces.append(torch.zeros(1, silence_samples))
-                    logger.debug(f"  Padded tail with {shortfall:.2f}s of silence.")
                     current_time = end
                 # --- END TIMELINE MODEL ---
 
                 segment_processing_time = time.time() - segment_t0
                 segment_processing_times.append(segment_processing_time)
-                logger.info(f"  Segment {idx+1} processed in {segment_processing_time:.2f}s")
+                
+                rtf = infer_time / generated_dur if generated_dur > 0 else 0
+                logger.info(f"  [PROFILER] Seg {idx+1} | NeMo: {nemo_time:.2f}s | XTTS: {infer_time:.2f}s (RTF {rtf:.2f}) | FFmpeg: {ffmpeg_time:.2f}s | Total: {segment_processing_time:.2f}s")
                 
                 next_idx_to_process += 1
             else:
