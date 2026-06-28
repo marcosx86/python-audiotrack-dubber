@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--reference-audio-path", default=None, help="Path to a single clean reference audio file (e.g. narrator_reference.wav) to extract global latents from, bypassing dynamic per-segment extraction.")
     parser.add_argument("--ffmpeg-path", default="ffmpeg", help="Custom path to the ffmpeg executable")
     parser.add_argument("--time-stretch", action="store_true", help="Enable FFmpeg time-stretching (condensation) to force generated audio to fit original timestamps")
+    parser.add_argument("--num-workers", type=int, default=1, help="Number of parallel XTTS inference threads. Warning: N>1 multiplies VRAM usage.")
     parser.add_argument("--start-sentence", type=int, default=None, help="1-indexed starting sentence to generate (inclusive)")
     parser.add_argument("--end-sentence", type=int, default=None, help="1-indexed ending sentence to generate (inclusive)")
     parser.add_argument("--cooldown", type=float, default=1.5, help="Artificial delay (in seconds) between LLM calls to prevent GPU overheating/BSODs (default: 1.5)")
@@ -189,7 +190,55 @@ def audio_extractor_worker(task_queue, segments, original_audio, ffmpeg_path, sk
     # Send a poison pill to indicate completion
     task_queue.put(None)
 
+def run_inference_worker(task, xtts, nemo_normalizer, global_gpt_cond_latent, global_speaker_embedding, cooldown):
+    import time
+    import torch
+    import os
+    idx = task['idx']
+    seg = task['seg']
+    reference_audio_path = task['wav_path']
+    extract_error = task['error']
+    trans_text = seg['trans_text']
+    
+    if extract_error and global_gpt_cond_latent is None:
+        return {'idx': idx, 'task': task, 'tensor': None, 'error': f"Failed to extract reference audio: {extract_error}"}
+
+    try:
+        trans_text = nemo_normalizer.normalize(trans_text, verbose=False)
+    except Exception as e:
+        pass # use original text
+        
+    try:
+        if global_gpt_cond_latent is not None:
+            gpt_cond_latent = global_gpt_cond_latent
+            speaker_embedding = global_speaker_embedding
+        else:
+            gpt_cond_latent, speaker_embedding = xtts.get_conditioning_latents(
+                audio_path=[reference_audio_path],
+                gpt_cond_len=30,
+            )
+            
+        out = xtts.inference(
+            text=trans_text,
+            language="pt",
+            gpt_cond_latent=gpt_cond_latent,
+            speaker_embedding=speaker_embedding,
+            speed=1.0
+        )
+        
+        if cooldown > 0:
+            time.sleep(cooldown)
+            
+        tts_speech = torch.from_numpy(out["wav"]).unsqueeze(0)
+        return {'idx': idx, 'task': task, 'tensor': tts_speech, 'error': None}
+    except Exception as e:
+        return {'idx': idx, 'task': task, 'tensor': None, 'error': str(e)}
+    finally:
+        if reference_audio_path and os.path.exists(reference_audio_path):
+            os.remove(reference_audio_path)
+
 def main():
+    from concurrent.futures import ThreadPoolExecutor
     args = parse_args()
 
     # Configure logging
@@ -315,127 +364,88 @@ def main():
     global_start_time = time.time()
     segment_processing_times = []
 
+    executor = ThreadPoolExecutor(max_workers=args.num_workers)
+    pending_futures = {}
+    next_idx_to_process = 0
+    
     while True:
-        wait_t0 = time.time()
         task = task_queue.get()
-        if task is None:
-            break # All segments processed
-            
-        segment_t0 = time.time()
-        wait_time = segment_t0 - wait_t0
-        idx = task['idx']
-        seg = task['seg']
-        reference_audio_path = task['wav_path']
-        extract_error = task['error']
         
-        start = seg['start']
-        end = seg['end']
-        duration = seg['duration']
-        orig_text = seg['orig_text']
-        trans_text = seg['trans_text']
-        
-        # Normalize text to Portuguese before processing
-        logger.debug(f"Calling NeMo to normalize target text: {trans_text}")
-        try:
-            trans_text = nemo_normalizer.normalize(trans_text, verbose=False)
-        except Exception as e:
-            logger.warning(f"NeMo normalization failed for '{trans_text}'. Using original text. Error: {e}")
-        
-        logger.info(f"[{global_offset + idx + 1}/{global_offset + len(segments)}{' (Trimmed)' if is_trimmed else ''}] Synthesizing clip: [{start:.2f}s - {end:.2f}s]")
-        logger.debug(f"[Consumer] Waited {wait_time:.3f}s for Producer queue")
-        logger.debug(f"  Reference Text: {orig_text}")
-        logger.debug(f"  Normalized Text:    {trans_text}")
-
-        if extract_error and not args.reference_audio_path:
-            logger.error(f"  Failed to extract reference audio: {extract_error}")
-            logger.warning("  Skipping this segment to continue pipeline.")
-            continue
-
-        # 1. Padding with Silence to emulate absolute timestamps
-        if start > current_time:
-            silence_dur = start - current_time
-            logger.debug(f"  Padding with {silence_dur:.2f}s of silence to align timeline.")
-            silence_samples = int(silence_dur * target_sr)
-            final_audio_pieces.append(torch.zeros(1, silence_samples))
-            current_time = start
-
-        # 2. Generate Audio
-        try:
-            if global_gpt_cond_latent is not None:
-                gpt_cond_latent = global_gpt_cond_latent
-                speaker_embedding = global_speaker_embedding
-            else:
-                logger.debug(f"[Consumer] Computing voice latents from reference audio...")
-                # Compute latents from dynamically extracted prompt audio
-                gpt_cond_latent, speaker_embedding = xtts.get_conditioning_latents(
-                    audio_path=[reference_audio_path],
-                    gpt_cond_len=30, # Max conditioning length is 30s
-                )
-            
-            infer_t0 = time.time()
-            
-            logger.debug(f"[Consumer] Calling xtts.inference...")
-            out = xtts.inference(
-                text=trans_text,
-                language="pt",
-                gpt_cond_latent=gpt_cond_latent,
-                speaker_embedding=speaker_embedding,
-                speed=1.0
+        if task is not None:
+            future = executor.submit(
+                run_inference_worker, 
+                task, 
+                xtts, 
+                nemo_normalizer, 
+                global_gpt_cond_latent, 
+                global_speaker_embedding,
+                args.cooldown
             )
+            pending_futures[task['idx']] = future
 
-            infer_time = time.time() - infer_t0
-            logger.debug(f"[Consumer] Finished inference in {infer_time:.3f}s")
-
-            if args.cooldown > 0:
-                logging.debug(f"[Consumer] Cooling down for {args.cooldown}s to protect hardware...")
-                time.sleep(args.cooldown)
-
-            cpu_t0 = time.time()
-            # Convert NumPy array to PyTorch tensor and add channel dimension
-            tts_speech = torch.from_numpy(out["wav"]).unsqueeze(0)
-            logger.debug(f"[Consumer] Converted numpy output to CPU tensor in {time.time() - cpu_t0:.3f}s")
-            
-            # --- START TIMELINE MODEL ---
-            generated_dur = tts_speech.shape[1] / target_sr
-            target_dur = end - start
-            
-            if generated_dur > target_dur:
-                if args.time_stretch:
-                    # 3a. Stretch audio if it exceeds strict window
-                    stretched_speech = apply_time_stretch_ffmpeg(tts_speech, target_sr, target_dur, args.ffmpeg_path)
-                    final_audio_pieces.append(stretched_speech)
-                    logger.debug(f"  Time-stretched audio from {generated_dur:.2f}s down to {target_dur:.2f}s.")
+        while len(pending_futures) >= args.num_workers * 2 or (task is None and next_idx_to_process < len(segments)):
+            if next_idx_to_process in pending_futures:
+                segment_t0 = time.time()
+                future_result = pending_futures.pop(next_idx_to_process).result()
+                
+                idx = future_result['idx']
+                seg = future_result['task']['seg']
+                tts_speech = future_result['tensor']
+                error = future_result['error']
+                
+                start = seg['start']
+                end = seg['end']
+                
+                logger.info(f"[{global_offset + idx + 1}/{global_offset + len(segments)}{' (Trimmed)' if is_trimmed else ''}] Post-processing clip: [{start:.2f}s - {end:.2f}s]")
+                
+                if error:
+                    logger.error(f"  TTS generation failed for segment {idx+1}: {error}")
+                    logger.warning("  Skipping this segment to continue pipeline.")
+                    next_idx_to_process += 1
+                    continue
                     
-                    generated_dur = stretched_speech.shape[1] / target_sr
-                    current_time = end
-                    logger.debug(f"  Timeline strictly advanced to {current_time:.2f}s.")
-                else:
-                    # 3b. Accept timeline drift (Condensation disabled)
-                    final_audio_pieces.append(tts_speech)
-                    current_time += generated_dur
-                    logger.warning(f"  Timeline drifted to {current_time:.2f}s (overshot by {generated_dur - target_dur:.2f}s).")
-            else:
-                # 3c. Pad with silence if it's shorter than strict window
-                final_audio_pieces.append(tts_speech)
-                shortfall = target_dur - generated_dur
-                silence_samples = int(shortfall * target_sr)
-                if silence_samples > 0:
+                # 1. Padding with Silence to emulate absolute timestamps
+                if start > current_time:
+                    silence_dur = start - current_time
+                    logger.debug(f"  Padding with {silence_dur:.2f}s of silence to align timeline.")
+                    silence_samples = int(silence_dur * target_sr)
                     final_audio_pieces.append(torch.zeros(1, silence_samples))
-                logger.debug(f"  Padded tail with {shortfall:.2f}s of silence.")
-                current_time = end
-                logger.debug(f"  Timeline strictly advanced to {current_time:.2f}s.")
-            # --- END TIMELINE MODEL ---
+                    current_time = start
 
-            segment_processing_time = time.time() - segment_t0
-            segment_processing_times.append(segment_processing_time)
-            logger.info(f"  Segment {idx+1} processed in {segment_processing_time:.2f}s")
-        except Exception as e:
-            logger.error(f"  TTS generation failed for segment {idx+1}: {e}")
-            logger.warning("  Skipping this segment to continue pipeline.")
-            continue
-        finally:
-            if reference_audio_path and os.path.exists(reference_audio_path):
-                os.remove(reference_audio_path)
+                # --- START TIMELINE MODEL ---
+                generated_dur = tts_speech.shape[1] / target_sr
+                target_dur = end - start
+                
+                if generated_dur > target_dur:
+                    if args.time_stretch:
+                        stretched_speech = apply_time_stretch_ffmpeg(tts_speech, target_sr, target_dur, args.ffmpeg_path)
+                        final_audio_pieces.append(stretched_speech)
+                        logger.debug(f"  Time-stretched audio from {generated_dur:.2f}s down to {target_dur:.2f}s.")
+                        current_time = end
+                    else:
+                        final_audio_pieces.append(tts_speech)
+                        current_time += generated_dur
+                        logger.warning(f"  Timeline drifted to {current_time:.2f}s (overshot by {generated_dur - target_dur:.2f}s).")
+                else:
+                    final_audio_pieces.append(tts_speech)
+                    shortfall = target_dur - generated_dur
+                    silence_samples = int(shortfall * target_sr)
+                    if silence_samples > 0:
+                        final_audio_pieces.append(torch.zeros(1, silence_samples))
+                    logger.debug(f"  Padded tail with {shortfall:.2f}s of silence.")
+                    current_time = end
+                # --- END TIMELINE MODEL ---
+
+                segment_processing_time = time.time() - segment_t0
+                segment_processing_times.append(segment_processing_time)
+                logger.info(f"  Segment {idx+1} processed in {segment_processing_time:.2f}s")
+                
+                next_idx_to_process += 1
+            else:
+                break
+                
+        if task is None:
+            break
 
     # Assemble and save
     logger.info("Concatenating all segments and silence buffers...")
